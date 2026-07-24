@@ -5,17 +5,32 @@ import math
 import collections
 import networkx as nx
 import matplotlib.pyplot as plt
+import q_func
 #%%
 class heom_spin_state:
     '''
     full HEOM state for a spin boson system encoded as a graph
     '''
-    def __init__(self, K, L):
+    def __init__(self, K, L,H_s= torch.zero([2,2]),C_list=[],gamma_list = []):
         self.K = K #truncation of Matsubara freq
         self.L = L #truncation of memory level
+        self.H_s = H_s #system Hamiltonian
+        self.C_list = C_list
+        self.gamma_list = gamma_list
         self.nADO = math.comb(L+K+1,L)#tot number of nADO
         self.nodes = torch.zeros([self.nADO,8])
         self.build_graph() 
+    def Gamma(self,n_vec):
+        #compute the coefficient related to decay rate (loop edge)
+        return torch.dot(self.gamma_list,torch.tensor(n_vec))
+    def build_edge_single(self,n_vec,edge_type,k):
+        if edge_type == 0: #loop, -i[H_s,rho] - \Gamma \rho
+            L0 = -1j*(q_func.left_sup_op(self.H_s)-q_func.right_sup_op(self.H_s))
+            L = L0 - self.Gamma(n_vec)*torch.eye(L0.size(0)).to(L0)
+            return q_func.sup_op_to_real(L)
+        elif edge_type == 1:
+            return 
+        
     def build_graph(self):
         node_to_idx = {} #hash map for converting ADO vector n to index in the node tensor
         idx_to_node = [] #list for converting node tensor index to ADO vector n
