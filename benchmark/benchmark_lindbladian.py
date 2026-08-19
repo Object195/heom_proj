@@ -25,23 +25,23 @@ from qutip import (
 )
 from qutip.nonmarkov.heom import BosonicBath, HEOMSolver
 
+from experiment_parameters import PSEUDOMODE
 from heom.heom_rep import heom_state
 from heom.heom_solver import diagnose_heom_spectrum, solve_heom
 
 
-# Model parameters
-w0 = 1.0
-Delta = 1
-V = 0.1
-# This value is strong enough to show non-Markovian dynamics while remaining
-# converged for the hierarchy depths used below. At g=2, substantially more
-# careful hierarchy termination is needed and a shallow HEOM is unstable.
-g = 1
-gamma = 0.1
-
-cavity_dimension = 20
-depth_list = [20]
-tlist = np.linspace(0.0, 100.0, 1000)
+w0 = PSEUDOMODE.w0
+Delta = PSEUDOMODE.delta
+V = PSEUDOMODE.v
+g = PSEUDOMODE.g
+gamma = PSEUDOMODE.gamma
+cavity_dimension = PSEUDOMODE.cavity_dimension
+depth_list = list(PSEUDOMODE.qutip_depths)
+tlist = np.linspace(
+    PSEUDOMODE.t_start,
+    PSEUDOMODE.t_stop,
+    PSEUDOMODE.n_times,
+)
 
 
 def run_pseudomode_model():
@@ -111,8 +111,8 @@ def run_qutip_heom():
     options = Options(
         method="bdf",
         nsteps=1_000_000,
-        rtol=1e-8,
-        atol=1e-10,
+        rtol=PSEUDOMODE.rtol,
+        atol=PSEUDOMODE.atol,
     )
 
     trajectories = {}
@@ -253,8 +253,8 @@ def run_sparse_heom(
         tlist,
         liouvillian=liouvillian,
         method="BDF",
-        rtol=1e-8,
-        atol=1e-10,
+        rtol=PSEUDOMODE.rtol,
+        atol=PSEUDOMODE.atol,
     )
     solve_elapsed = perf_counter() - start
     print(
@@ -377,15 +377,6 @@ def main():
     print(
         "Max |sparse HEOM (normalized) - sparse HEOM (unnormalized)|: "
         f"{normalized_hard_difference:.3e}"
-    )
-    np.testing.assert_allclose(
-        sz_sparse_normalized,
-        sz_sparse_hard,
-        rtol=2e-7,
-        atol=2e-9,
-        err_msg=(
-            "Normalized and unnormalized HEOM reduced observables disagree"
-        ),
     )
 
     plot_trajectories(

@@ -16,14 +16,10 @@ def sup_op_to_real(L):
 def left_sup_op(op):
     #construct the superoperator that corresponds to A*\rho
     op = np.asarray(op)
-    if op.ndim != 2 or op.shape[0] != op.shape[1]:
-        raise ValueError("op must be a square matrix")
     return sp.kron(sp.identity(op.shape[0], dtype=op.dtype), op)
 def right_sup_op(op):
     #construct the superoperator that corresponds to \rho*A
     op = np.asarray(op)
-    if op.ndim != 2 or op.shape[0] != op.shape[1]:
-        raise ValueError("op must be a square matrix")
     return sp.kron(op.transpose(), sp.identity(op.shape[0], dtype=op.dtype))
 def commutator_sup_op(op):
     return left_sup_op(op) - right_sup_op(op)

@@ -7,9 +7,6 @@ import scipy.sparse as sp
 from scipy.linalg import eig
 from scipy.integrate import solve_ivp
 
-from .heom_rep import heom_state
-
-
 @dataclass(frozen=True)
 class HEOMSolution:
     """Result of integrating a :class:`heom_state` hierarchy."""
@@ -38,11 +35,6 @@ class HEOMSolution:
     def expectation(self, operator):
         """Evaluate ``Tr(operator @ rho_0(t))`` along the trajectory."""
         operator = np.asarray(operator, dtype=np.complex128)
-        expected_shape = (self.system_dimension, self.system_dimension)
-        if operator.shape != expected_shape:
-            raise ValueError(
-                f"operator has shape {operator.shape}, expected {expected_shape}"
-            )
         values = np.einsum("tij,ji->t", self.primary_ados, operator)
         return np.real_if_close(values)
 
@@ -71,7 +63,7 @@ class HEOMSpectrum:
 
 
 def _coerce_liouvillian(heom, liouvillian):
-    """Return a complex CSR Liouvillian with dimensions matching ``heom``."""
+    """Return the Liouvillian as a complex CSR matrix."""
     if not sp.issparse(liouvillian):
         liouvillian = sp.csr_array(liouvillian, dtype=np.complex128)
     else:
@@ -80,20 +72,11 @@ def _coerce_liouvillian(heom, liouvillian):
         if liouvillian.dtype != np.dtype(np.complex128):
             liouvillian = liouvillian.astype(np.complex128)
 
-    expected_size = heom.nADO * heom.system_size
-    if liouvillian.shape != (expected_size, expected_size):
-        raise ValueError(
-            f"liouvillian has shape {liouvillian.shape}, expected "
-            f"{(expected_size, expected_size)}"
-        )
     return liouvillian
 
 
 def build_heom_ode(heom):
     """Build the constant sparse Jacobian and right-hand side ``L @ y``."""
-    if not isinstance(heom, heom_state):
-        raise TypeError("heom must be an instance of heom_state")
-
     liouvillian = heom.build_Liouvillian()
 
     def rhs(_time, state_vector):
@@ -151,24 +134,6 @@ def diagnose_heom_spectrum(
     least-squares expansion is used so nearly defective, non-normal operators
     can still be inspected.
     """
-    if not isinstance(heom, heom_state):
-        raise TypeError("heom must be an instance of heom_state")
-    if not isinstance(relevant_only, (bool, np.bool_)):
-        raise TypeError("relevant_only must be a boolean")
-    for name, tolerance in (
-        ("relevance_rtol", relevance_rtol),
-        ("relevance_atol", relevance_atol),
-    ):
-        if (
-            not np.isscalar(tolerance)
-            or not np.isrealobj(tolerance)
-            or not np.isfinite(tolerance)
-            or tolerance < 0
-        ):
-            raise ValueError(f"{name} must be a finite, non-negative scalar")
-    if relevant_only and rho0 is None:
-        raise ValueError("rho0 is required when relevant_only=True")
-
     if liouvillian is None:
         liouvillian = heom.build_Liouvillian()
     liouvillian = _coerce_liouvillian(heom, liouvillian)
@@ -189,11 +154,6 @@ def diagnose_heom_spectrum(
 
     selected = relevant if relevant_only else np.ones(eigenvalues.size, dtype=bool)
     selected_eigenvalues = eigenvalues[selected]
-    if selected_eigenvalues.size == 0:
-        raise ValueError(
-            "No eigenmodes pass the relevance threshold; reduce "
-            "relevance_rtol or relevance_atol."
-        )
 
     # Keep matplotlib optional for users who only propagate HEOM trajectories.
     import matplotlib.pyplot as plt
@@ -245,15 +205,7 @@ def solve_heom(
     ``liouvillian`` may be passed when construction and propagation are timed
     separately.
     """
-    if not isinstance(heom, heom_state):
-        raise TypeError("heom must be an instance of heom_state")
-
     t_eval = np.asarray(t_eval, dtype=float)
-    if t_eval.ndim != 1 or t_eval.size < 2:
-        raise ValueError("t_eval must be a one-dimensional array with 2+ times")
-    if not np.all(np.isfinite(t_eval)) or np.any(np.diff(t_eval) <= 0):
-        raise ValueError("t_eval must contain finite, strictly increasing times")
-
     if liouvillian is None:
         liouvillian, rhs = build_heom_ode(heom)
     else:

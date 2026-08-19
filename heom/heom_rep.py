@@ -26,11 +26,6 @@ class heom_state:
         C_list=None,
         gamma_list=None,
     ):
-        if not isinstance(K, (int, np.integer)) or K < 0:
-            raise ValueError("K must be a non-negative integer")
-        if not isinstance(L, (int, np.integer)) or L < 0:
-            raise ValueError("L must be a non-negative integer")
-
         if H_s is None:
             H_s = np.zeros((2, 2), dtype=np.complex128)
         else:
@@ -40,19 +35,10 @@ class heom_state:
         else:
             H_c = np.asarray(H_c)
 
-        if H_s.ndim != 2 or H_s.shape[0] != H_s.shape[1]:
-            raise ValueError("H_s must be a square matrix")
-        if H_c.shape != H_s.shape:
-            raise ValueError("H_c must have the same shape as H_s")
-
         if C_list is not None:
             C_list = np.asarray(C_list, dtype=np.complex128)
-            if C_list.ndim != 1 or C_list.size != K + 1:
-                raise ValueError("C_list must contain exactly K + 1 coefficients")
         if gamma_list is not None:
             gamma_list = np.asarray(gamma_list, dtype=np.complex128)
-            if gamma_list.ndim != 1 or gamma_list.size != K + 1:
-                raise ValueError("gamma_list must contain exactly K + 1 coefficients")
 
         self.K = K #truncation of Matsubara freq
         self.L = L #truncation of memory level
@@ -104,8 +90,6 @@ class heom_state:
 
     def Gamma(self, node):
         #compute the coefficient related to decay rate (loop edge)
-        if self.gamma_list is None:
-            raise ValueError("gamma_list is required to construct the Liouvillian")
         n_vec, m_vec = self._split_node(node)
         return (
             np.dot(self.gamma_list, n_vec)
@@ -115,7 +99,6 @@ class heom_state:
         # Construct the superoperator that acts on one ADO.
         # Normalization does not change a block whose source and target ADO
         # are the same, but accepting the option keeps the block API uniform.
-        self._validate_normalized(normalized)
         L0 = -1j*(q_func.commutator_sup_op(self.H_s))
         # L0 is expected to be a scipy.sparse matrix
         L = L0 - self.Gamma(node) * sp.identity(L0.shape[0], dtype=L0.dtype)
@@ -135,19 +118,6 @@ class heom_state:
         )
         return np.sqrt(self._occupation(node, branch, k) * coefficient)
 
-    def _validate_normalized(self, normalized):
-        if not isinstance(normalized, (bool, np.bool_)):
-            raise TypeError("normalized must be a boolean")
-        if normalized and self.C_list is None:
-            raise ValueError(
-                "C_list is required to construct normalized coupling blocks"
-            )
-        if normalized and np.any(self.C_list == 0):
-            raise ValueError(
-                "Normalized ADOs require every coefficient in C_list to be "
-                "non-zero."
-            )
-
     def couple_up(self, node=None, branch=None, k=None, normalized=False):
         '''
         Construct the block coupling an ADO to either an n or m successor.
@@ -156,15 +126,9 @@ class heom_state:
         it is multiplied by ``sqrt((occupation + 1) C_k)`` on an n branch or
         by its conjugate-coefficient counterpart on an m branch.
         '''
-        self._validate_normalized(normalized)
         coupling = -1j*q_func.commutator_sup_op(self.H_c)
         if not normalized:
             return coupling
-        if node is None or branch is None or k is None:
-            raise ValueError(
-                "node, branch, and k are required for a normalized "
-                "up-coupling"
-            )
         successor = self._shift_node(node, branch, k, 1)
         return self._normalization_step(successor, branch, k) * coupling
 
@@ -197,15 +161,9 @@ class heom_state:
         step.  On separate n/m branches this gives the requested square-root
         lowering coefficients exactly.
         '''
-        self._validate_normalized(normalized)
         core = self._downward_core(node, branch, k)
         if normalized:
             normalization_step = self._normalization_step(node, branch, k)
-            if normalization_step == 0:
-                raise ValueError(
-                    "A normalized down-coupling requires a non-zero "
-                    "occupation"
-                )
             core = core / normalization_step
         return -1j * core
 
@@ -230,7 +188,6 @@ class heom_state:
         where ``A`` is the lowering term without its factor ``-i`` and
         K_M = i H_s^x + Gamma(M) I.  The linear system is solved directly.
         '''
-        self._validate_normalized(normalized)
         if self._occupation(node, branch, k) == 0:
             return sp.csr_array(
                 (self.system_size, self.system_size),
@@ -263,11 +220,6 @@ class heom_state:
             -q_func.commutator_sup_op(self.H_c) @ eliminated_coupling
         )
         if normalized:
-            if target_branch is None or target_k is None:
-                raise ValueError(
-                    "target_branch and target_k are required for a "
-                    "normalized Markovian coupling"
-                )
             correction = correction * (
                 self._normalization_step(node, target_branch, target_k)
                 / self._normalization_step(node, branch, k)
@@ -282,11 +234,6 @@ class heom_state:
         so only the all-zero primary ADO is non-zero at t=0.
         """
         rho0 = np.asarray(rho0, dtype=np.complex128)
-        if rho0.shape != self.H_s.shape:
-            raise ValueError(
-                f"Initial density matrix rho0 has shape {rho0.shape}, "
-                f"but expected shape {self.H_s.shape}."
-            )
         total_size = self.nADO * self.system_size
         initial_heom_vec = np.zeros(total_size, dtype=np.complex128)
 
@@ -319,18 +266,6 @@ class heom_state:
         time; this is a complex similarity scaling rather than a positive
         norm.
         '''
-        if (
-            self.C_list is None
-            or self.gamma_list is None
-        ):
-            raise ValueError(
-                "C_list and gamma_list are required to construct "
-                "the Liouvillian"
-            )
-        if not isinstance(markovian_terminator, (bool, np.bool_)):
-            raise TypeError("markovian_terminator must be a boolean")
-        self._validate_normalized(normalized)
-
         total_size = self.nADO * self.system_size
         liouvillian = sp.lil_array(
             (total_size, total_size),
@@ -432,14 +367,7 @@ class heom_state:
                         ] = current_block + markovian_couplings[coupling_key]
 
         liouvillian = liouvillian.tocsr()
-        # Record how the current cached operator was assembled.  Downstream
-        # solvers can then reject a same-shaped Liouvillian with incompatible
-        # normalization or boundary termination.
         self.liouvillian = liouvillian
-        self.liouvillian_options = {
-            "markovian_terminator": bool(markovian_terminator),
-            "normalized": bool(normalized),
-        }
         return liouvillian
     def build_hierarchy(self):
         '''

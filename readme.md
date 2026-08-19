@@ -15,47 +15,25 @@ liouvillian = hierarchy.build_Liouvillian(
 )
 ```
 
-The same sparse operator can be passed to both `solve_heom` and
-`HEOMPINNLoss`, ensuring numerical and MLP trajectories use identical state
-ordering and truncation.
+Physical pseudomode parameters and all MLP/training hyperparameters live in
+`experiment_parameters.py`.
 
-```python
-from model import (
-    HEOMMLP,
-    HEOMPINNLoss,
-    LossWeights,
-    TrainingConfig,
-    train_mlp,
-)
+Train and save the configured network to
+`saved_models/mlp/mlp_state_dict.pt` with:
 
-network = HEOMMLP(hierarchy, hidden_sizes=(64, 64, 64))
-training = TrainingConfig(
-    t_start=0.0,
-    t_stop=100.0,
-    collocation_points=512,
-)
-objective = HEOMPINNLoss(
-    hierarchy,
-    rho0,
-    liouvillian=liouvillian,
-    weights=LossWeights.balanced(training.collocation_points),
-)
-result = train_mlp(network, objective, training)
+```powershell
+python -m model.train_mlp_model
 ```
 
 Run the three-trajectory comparison (explicit Lindbladian, sparse HEOM, and
-MLP) with:
+the saved MLP) with:
 
 ```powershell
 python -m benchmark.benchmark_mlp
 ```
 
-For a quick smoke run:
-
-```powershell
-python -m benchmark.benchmark_mlp --depth 3 --t-stop 5 `
-    --n-times 101 --epochs 20 --collocation-points 32 --no-show
-```
+The benchmark performs no training. It reconstructs the configured MLP,
+loads the saved state dictionary, and evaluates the trajectory.
 
 The neural pipeline requires PyTorch.  The benchmark additionally requires
 QuTiP and Matplotlib.
