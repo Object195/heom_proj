@@ -5,7 +5,8 @@ import math
 import collections
 import networkx as nx
 import matplotlib.pyplot as plt
-import q_func
+
+from . import q_func
 #%%
 class heom_spin_state:
     '''

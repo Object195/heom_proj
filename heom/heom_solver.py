@@ -7,7 +7,7 @@ import scipy.sparse as sp
 from scipy.linalg import eig
 from scipy.integrate import solve_ivp
 
-from heom_rep import heom_state
+from .heom_rep import heom_state
 
 
 @dataclass(frozen=True)

@@ -1,6 +1,15 @@
 """Compare a damped pseudomode with QuTiP and the local HEOM builder."""
 
+import sys
+from pathlib import Path
 from time import perf_counter
+
+# Allow both ``python -m benchmark.benchmark_lindbladian`` and direct file
+# execution from an IDE.  Direct execution otherwise places only the
+# ``benchmark`` directory on Python's module search path.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,8 +25,8 @@ from qutip import (
 )
 from qutip.nonmarkov.heom import BosonicBath, HEOMSolver
 
-from heom_rep import heom_state
-from heom_solver import diagnose_heom_spectrum, solve_heom
+from heom.heom_rep import heom_state
+from heom.heom_solver import diagnose_heom_spectrum, solve_heom
 
 
 # Model parameters

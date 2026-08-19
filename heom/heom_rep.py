@@ -4,8 +4,9 @@ import collections
 import numpy as np
 import scipy.sparse as sp
 import matplotlib.pyplot as plt
-import q_func
 import networkx as nx
+
+from . import q_func
 #%%
 class heom_state:
     """Construct a free-pole HEOM hierarchy and its sparse Liouvillian.
@@ -326,10 +327,15 @@ class heom_state:
                 "C_list and gamma_list are required to construct "
                 "the Liouvillian"
             )
+        if not isinstance(markovian_terminator, (bool, np.bool_)):
+            raise TypeError("markovian_terminator must be a boolean")
         self._validate_normalized(normalized)
 
         total_size = self.nADO * self.system_size
-        self.liouvillian = sp.lil_array((total_size, total_size), dtype=np.complex128)
+        liouvillian = sp.lil_array(
+            (total_size, total_size),
+            dtype=np.complex128,
+        )
         markovian_couplings = {}
 
         for i in range(self.nADO):
@@ -338,7 +344,7 @@ class heom_state:
             end_i = (i + 1) * self.system_size
 
             # Diagonal block: (-i[H_s, .] - Gamma(node_i)) rho_i
-            self.liouvillian[start_i:end_i, start_i:end_i] = self.couple_diag(
+            liouvillian[start_i:end_i, start_i:end_i] = self.couple_diag(
                 node_i,
                 normalized=normalized,
             )
@@ -352,7 +358,7 @@ class heom_state:
                     continue
                 start_j_up = j_up * self.system_size
                 end_j_up = (j_up + 1) * self.system_size
-                self.liouvillian[start_i:end_i, start_j_up:end_j_up] = (
+                liouvillian[start_i:end_i, start_j_up:end_j_up] = (
                     self.couple_up(
                         node_i,
                         branch,
@@ -366,7 +372,7 @@ class heom_state:
             for j_down, branch, k_mode in self.edge_down.get(i, []):
                 start_j_down = j_down * self.system_size
                 end_j_down = (j_down + 1) * self.system_size
-                self.liouvillian[start_i:end_i, start_j_down:end_j_down] = self.couple_down(
+                liouvillian[start_i:end_i, start_j_down:end_j_down] = self.couple_down(
                     node_i,
                     branch,
                     k_mode,
@@ -397,7 +403,7 @@ class heom_state:
                         start_source = source_idx * self.system_size
                         end_source = (source_idx + 1) * self.system_size
 
-                        current_block = self.liouvillian[
+                        current_block = liouvillian[
                             start_i:end_i,
                             start_source:end_source,
                         ]
@@ -420,13 +426,21 @@ class heom_state:
                                     target_k=j_mode,
                                 )
                             )
-                        self.liouvillian[
+                        liouvillian[
                             start_i:end_i,
                             start_source:end_source,
                         ] = current_block + markovian_couplings[coupling_key]
 
-        self.liouvillian = self.liouvillian.tocsr()
-        return self.liouvillian
+        liouvillian = liouvillian.tocsr()
+        # Record how the current cached operator was assembled.  Downstream
+        # solvers can then reject a same-shaped Liouvillian with incompatible
+        # normalization or boundary termination.
+        self.liouvillian = liouvillian
+        self.liouvillian_options = {
+            "markovian_terminator": bool(markovian_terminator),
+            "normalized": bool(normalized),
+        }
+        return liouvillian
     def build_hierarchy(self):
         '''
         build hierarchy structure and index all ADOs
