@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from time import perf_counter
-from typing import NamedTuple
 
 import numpy as np
 import scipy.sparse as sp
@@ -16,24 +15,6 @@ from heom import q_func
 from heom.heom_rep import heom_state
 
 from .mlp import HEOMMLP, state_and_time_derivative
-
-
-@dataclass(frozen=True)
-class LossWeights:
-    dynamics: float = 1.0
-    initial_condition: float = 1.0
-    trace: float = 1.0
-
-    @classmethod
-    def balanced(cls, q_x: int) -> "LossWeights":
-        return cls(initial_condition=float(q_x), trace=1.0 / q_x)
-
-
-class LossTerms(NamedTuple):
-    total: torch.Tensor
-    dynamics: torch.Tensor
-    initial_condition: torch.Tensor
-    trace: torch.Tensor
 
 
 def scipy_sparse_to_torch(
@@ -62,15 +43,13 @@ def scipy_sparse_to_torch(
 
 
 class HEOMPINNLoss(nn.Module):
-    """Dynamical, initial-condition, and trace losses from Section III."""
+    """HEOM dynamical residual for a hard-constrained ``HEOMMLP``."""
 
     def __init__(
         self,
         hierarchy: heom_state,
-        rho0,
         *,
         liouvillian=None,
-        weights: LossWeights = LossWeights(),
         dtype: torch.dtype = torch.float64,
         device: torch.device | str | None = None,
     ) -> None:
@@ -81,9 +60,6 @@ class HEOMPINNLoss(nn.Module):
                 normalized=True,
             )
 
-        self.weights = weights
-        self.system_dimension = hierarchy.H_s.shape[0]
-        self.system_size = hierarchy.system_size
         self.state_size = hierarchy.nADO * hierarchy.system_size
 
         real_liouvillian = q_func.sup_op_to_real(liouvillian).tocsr()
@@ -94,23 +70,6 @@ class HEOMPINNLoss(nn.Module):
                 dtype=dtype,
                 device=device,
             ),
-        )
-
-        initial_complex = hierarchy.build_initial_state(rho0, as_sparse=False)
-        self.register_buffer(
-            "initial_state",
-            torch.as_tensor(
-                q_func.state_to_real(initial_complex),
-                dtype=dtype,
-                device=device,
-            ),
-        )
-        diagonal = np.arange(self.system_dimension) * (
-            self.system_dimension + 1
-        )
-        self.register_buffer(
-            "root_diagonal_indices",
-            torch.as_tensor(diagonal, dtype=torch.long, device=device),
         )
 
     def rhs(self, state: torch.Tensor) -> torch.Tensor:
@@ -125,41 +84,18 @@ class HEOMPINNLoss(nn.Module):
         time_derivative: torch.Tensor,
     ) -> torch.Tensor:
         residual = time_derivative - self.rhs(state)
-        return residual.square().sum() / (self.state_size)
-
-    def initial_condition_loss(self, model: HEOMMLP) -> torch.Tensor:
-        initial_time = self.initial_state.new_tensor([model.t_start])
-        prediction = model(initial_time)[0]
-        return (
-            prediction - self.initial_state
-        ).square().sum() / self.state_size
-
-    def trace_loss(self, state: torch.Tensor) -> torch.Tensor:
-        root_trace = state[:, : self.state_size].index_select(
-            1,
-            self.root_diagonal_indices,
-        ).sum(dim=1)
-        return (root_trace - 1.0).square().sum()
+        return residual.square().sum() / (
+            self.state_size * state.shape[0]
+        )
 
     def forward(
         self,
         model: HEOMMLP,
         times,
-        *,
-        q_x: int | None = None,
-    ) -> LossTerms:
+    ) -> torch.Tensor:
         times = model.prepare_times(times)
-        batch_size = times.numel()
         state, time_derivative = state_and_time_derivative(model, times)
-        dynamics = self.dynamics_loss(state, time_derivative)/ batch_size
-        initial_condition = self.initial_condition_loss(model)
-        trace = self.trace_loss(state)/ batch_size
-        total = (
-            self.weights.dynamics * dynamics
-            + self.weights.initial_condition * initial_condition
-            + self.weights.trace * trace
-        )
-        return LossTerms(total, dynamics, initial_condition, trace)
+        return self.dynamics_loss(state, time_derivative)
 
 
 @dataclass(frozen=True)
@@ -180,10 +116,7 @@ class TrainingConfig:
 @dataclass(frozen=True)
 class EpochRecord:
     epoch: int
-    total: float
-    dynamics: float
-    initial_condition: float
-    trace: float
+    loss: float
 
 
 @dataclass(frozen=True)
@@ -271,29 +204,22 @@ def train_mlp(
             generator=generator,
         )
 
-        totals = np.zeros(4)
+        total = 0.0
         for first in range(0, config.collocation_points, config.batch_size):
             indices = order[first : first + config.batch_size]
             batch_times = collocation_times[indices]
             optimizer.zero_grad(set_to_none=True)
-            terms = objective(
-                model,
-                batch_times,
-                q_x=config.collocation_points,
-            )
-            terms.total.backward()
+            loss = objective(model, batch_times)
+            loss.backward()
             if config.gradient_clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
                     config.gradient_clip_norm,
                 )
             optimizer.step()
-            totals += batch_times.numel() * np.asarray(
-                [term.detach().item() for term in terms]
-            )
+            total += batch_times.numel() * loss.detach().item()
 
-        averages = totals / config.collocation_points
-        record = EpochRecord(epoch, *averages.tolist())
+        record = EpochRecord(epoch, total / config.collocation_points)
         history.append(record)
         if callback is not None:
             callback(record)
@@ -304,8 +230,7 @@ def train_mlp(
         ):
             print(
                 f"Epoch {epoch:6d}/{config.epochs}: "
-                f"loss={record.total:.6e}, dynamics={record.dynamics:.6e}, "
-                f"IC={record.initial_condition:.6e}, trace={record.trace:.6e}"
+                f"loss={record.loss:.6e}"
             )
 
     return TrainingResult(
@@ -358,8 +283,6 @@ def solve_mlp(
 __all__ = [
     "EpochRecord",
     "HEOMPINNLoss",
-    "LossTerms",
-    "LossWeights",
     "MLPSolution",
     "TrainingConfig",
     "TrainingResult",

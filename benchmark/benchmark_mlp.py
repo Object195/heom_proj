@@ -109,12 +109,13 @@ def run_sparse_numerics(hierarchy, rho0, liouvillian, t_eval):
     return np.real(result.expectation(sigmaz().full()))
 
 
-def load_mlp(hierarchy):
+def load_mlp(hierarchy, rho0):
     """Rebuild the configured architecture and load its trained weights."""
     device = torch.device(MLP.device)
     model = HEOMMLP(
         hierarchy,
         hidden_sizes=MLP.hidden_sizes,
+        rho0=rho0,
         t_start=PSEUDOMODE.t_start,
         t_stop=PSEUDOMODE.t_stop,
         activation=MLP.activation,
@@ -196,7 +197,7 @@ def main(argv=None):
         liouvillian,
         t_eval,
     )
-    mlp = run_mlp_solver(load_mlp(hierarchy), t_eval)
+    mlp = run_mlp_solver(load_mlp(hierarchy, rho0), t_eval)
 
     print(
         "Max |sparse HEOM - Lindbladian|: "

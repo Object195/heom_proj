@@ -34,6 +34,10 @@ def make_hierarchy(depth=2):
     )
 
 
+def make_rho0():
+    return np.diag([1.0, 0.0]).astype(np.complex128)
+
+
 def test_coordinates_and_partner_permutation_follow_bfs_order():
     hierarchy = make_hierarchy(depth=2)
     assert hierarchy.idx_to_node == [
@@ -68,6 +72,7 @@ def test_coordinate_minibatch_has_section_three_shape():
     model = HEOMMLP(
         hierarchy,
         hidden_sizes=(4,),
+        rho0=make_rho0(),
         t_start=2.0,
         t_stop=6.0,
     )
@@ -87,12 +92,14 @@ def test_physical_time_derivative_includes_normalization_chain_rule():
     short_interval = HEOMMLP(
         hierarchy,
         hidden_sizes=(5,),
+        rho0=make_rho0(),
         t_start=0.0,
         t_stop=2.0,
     )
     long_interval = HEOMMLP(
         hierarchy,
         hidden_sizes=(5,),
+        rho0=make_rho0(),
         t_start=0.0,
         t_stop=10.0,
     )
@@ -129,6 +136,7 @@ def test_symmetrization_enforces_adjoint_partners():
     model = HEOMMLP(
         hierarchy,
         hidden_sizes=(5,),
+        rho0=make_rho0(),
         t_start=0.0,
         t_stop=1.0,
     )
@@ -149,13 +157,12 @@ def test_symmetrization_enforces_adjoint_partners():
 
 def test_requested_liouvillian_and_sparse_rhs_match_scipy():
     hierarchy = make_hierarchy(depth=1)
-    rho0 = np.diag([1.0, 0.0]).astype(np.complex128)
     with patch.object(
         hierarchy,
         "build_Liouvillian",
         wraps=hierarchy.build_Liouvillian,
     ) as constructor:
-        objective = HEOMPINNLoss(hierarchy, rho0)
+        objective = HEOMPINNLoss(hierarchy)
     constructor.assert_called_once_with(
         markovian_terminator=False,
         normalized=True,
@@ -172,34 +179,81 @@ def test_requested_liouvillian_and_sparse_rhs_match_scipy():
     np.testing.assert_allclose(actual.numpy()[0], expected, atol=1e-13)
 
 
-def test_initial_condition_is_evaluated_at_physical_interval_start():
+def test_output_enforces_initial_state_and_root_trace():
     hierarchy = make_hierarchy(depth=1)
-    rho0 = np.diag([1.0, 0.0]).astype(np.complex128)
+    rho0 = make_rho0()
     model = HEOMMLP(
         hierarchy,
         hidden_sizes=(5,),
+        rho0=rho0,
         t_start=2.0,
         t_stop=6.0,
     )
-    objective = HEOMPINNLoss(hierarchy, rho0)
-    prediction = model(torch.tensor([2.0], dtype=torch.float64))[0]
-    expected = (
-        prediction - objective.initial_state
-    ).square().sum() / objective.state_size
-    torch.testing.assert_close(objective.initial_condition_loss(model), expected)
+    times = torch.tensor([2.0, 3.0, 6.0], dtype=torch.float64)
+    states = model(times)
+    torch.testing.assert_close(states[0], model.initial_state)
+
+    correction = model.state_correction(times)
+    real_correction, imaginary_correction = correction.split(
+        model.state_size, dim=-1
+    )
+    real_trace = real_correction.index_select(
+        1, model.root_diagonal_indices
+    ).sum(dim=1)
+    imaginary_trace = imaginary_correction.index_select(
+        1, model.root_diagonal_indices
+    ).sum(dim=1)
+    torch.testing.assert_close(real_trace, torch.zeros_like(real_trace))
+    torch.testing.assert_close(
+        imaginary_trace, torch.zeros_like(imaginary_trace)
+    )
+
+    raw_real, raw_imaginary = model.symmetrize_raw(model.raw_output(times))
+    torch.testing.assert_close(
+        real_correction[:, model.system_size :],
+        raw_real[:, model.system_size :],
+    )
+    torch.testing.assert_close(
+        imaginary_correction[:, model.system_size :],
+        raw_imaginary[:, model.system_size :],
+    )
+
+    correction_ados = torch.complex(
+        real_correction, imaginary_correction
+    ).reshape(times.numel(), hierarchy.nADO, hierarchy.system_size)
+    correction_matrices = column_vector_to_matrix(correction_ados, 2)
+    partners = torch.as_tensor(conjugate_ado_permutation(hierarchy))
+    torch.testing.assert_close(
+        correction_matrices[:, partners],
+        correction_matrices.transpose(-2, -1).conj(),
+    )
+
+    root_traces = torch.diagonal(
+        model.root_density_matrices(times), dim1=-2, dim2=-1
+    ).sum(dim=-1)
+    torch.testing.assert_close(root_traces, torch.ones_like(root_traces))
+
+    _, initial_derivative = state_and_time_derivative(model, times[:1])
+    expected_initial_derivative = model.state_correction(times[:1]) / (
+        model.t_stop - model.t_start
+    )
+    torch.testing.assert_close(
+        initial_derivative, expected_initial_derivative
+    )
 
 
 def test_jvp_and_loss_backpropagate_to_every_parameter():
     hierarchy = make_hierarchy(depth=1)
     liouvillian = hierarchy.build_Liouvillian(normalized=True)
-    rho0 = np.diag([1.0, 0.0]).astype(np.complex128)
+    rho0 = make_rho0()
     model = HEOMMLP(
         hierarchy,
         hidden_sizes=(8, 8),
+        rho0=rho0,
         t_start=0.0,
         t_stop=4.0,
     )
-    objective = HEOMPINNLoss(hierarchy, rho0, liouvillian=liouvillian)
+    objective = HEOMPINNLoss(hierarchy, liouvillian=liouvillian)
     times = torch.linspace(0.25, 3.75, 4, dtype=torch.float64)
     states, derivatives = state_and_time_derivative(model, times)
     finite_difference = (
@@ -212,7 +266,12 @@ def test_jvp_and_loss_backpropagate_to_every_parameter():
         atol=1e-8,
     )
 
-    objective(model, times).total.backward()
+    loss = objective(model, times)
+    expected_loss = (
+        derivatives - objective.rhs(states)
+    ).square().sum() / (model.state_size * times.numel())
+    torch.testing.assert_close(loss, expected_loss)
+    loss.backward()
     assert states.shape == (4, 2 * model.state_size)
     assert all(
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
@@ -223,37 +282,34 @@ def test_jvp_and_loss_backpropagate_to_every_parameter():
 def test_partial_minibatches_match_the_full_objective():
     hierarchy = make_hierarchy(depth=1)
     liouvillian = hierarchy.build_Liouvillian(normalized=True)
-    rho0 = np.diag([1.0, 0.0]).astype(np.complex128)
     model = HEOMMLP(
         hierarchy,
         hidden_sizes=(5,),
+        rho0=make_rho0(),
         t_start=0.0,
         t_stop=1.0,
     )
-    objective = HEOMPINNLoss(hierarchy, rho0, liouvillian=liouvillian)
+    objective = HEOMPINNLoss(hierarchy, liouvillian=liouvillian)
     times = torch.linspace(0.0, 1.0, 5, dtype=torch.float64)
-    full = objective(model, times, q_x=5)
-    first = objective(model, times[:2], q_x=5)
-    second = objective(model, times[2:], q_x=5)
-    combined = [
-        (2 * first_term + 3 * second_term) / 5
-        for first_term, second_term in zip(first, second)
-    ]
-    for full_term, combined_term in zip(full, combined):
-        torch.testing.assert_close(full_term, combined_term)
+    full = objective(model, times)
+    first = objective(model, times[:2])
+    second = objective(model, times[2:])
+    combined = (2 * first + 3 * second) / 5
+    torch.testing.assert_close(full, combined)
 
 
 def test_short_training_and_solution_layout():
     hierarchy = make_hierarchy(depth=1)
     liouvillian = hierarchy.build_Liouvillian(normalized=True)
-    rho0 = np.diag([1.0, 0.0]).astype(np.complex128)
+    rho0 = make_rho0()
     model = HEOMMLP(
         hierarchy,
         hidden_sizes=(6,),
+        rho0=rho0,
         t_start=0.0,
         t_stop=0.2,
     )
-    objective = HEOMPINNLoss(hierarchy, rho0, liouvillian=liouvillian)
+    objective = HEOMPINNLoss(hierarchy, liouvillian=liouvillian)
     result = train_mlp(
         model,
         objective,
@@ -268,6 +324,7 @@ def test_short_training_and_solution_layout():
     )
     solution = solve_mlp(model, np.linspace(0.0, 0.2, 3), batch_size=2)
     assert len(result.history) == 2
+    assert np.isfinite(result.final.loss)
     np.testing.assert_allclose(solution.t, np.linspace(0.0, 0.2, 3))
     assert solution.y.shape == (model.state_size, 3)
     np.testing.assert_allclose(

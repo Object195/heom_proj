@@ -18,7 +18,7 @@ class PseudomodeParameters:
     heom_depth: int = 5
     qutip_depths: tuple[int, ...] = (5,)
     t_start: float = 0.0
-    t_stop: float = 100
+    t_stop: float = 0.1
     n_times: int = 1_000
     rtol: float = 1e-8
     atol: float = 1e-10
@@ -39,9 +39,6 @@ class MLPParameters:
     resample_each_epoch: bool = True
     seed: int = 0
     log_every: int = 100
-    dynamics_weight: float = 2
-    initial_condition_weight: float = 1
-    trace_weight: float = 0.5
     inference_batch_size: int = 1024
 
 

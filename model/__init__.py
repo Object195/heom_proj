@@ -11,8 +11,6 @@ from .mlp import (
 from .training import (
     EpochRecord,
     HEOMPINNLoss,
-    LossTerms,
-    LossWeights,
     MLPSolution,
     TrainingConfig,
     TrainingResult,
@@ -24,8 +22,6 @@ __all__ = [
     "EpochRecord",
     "HEOMMLP",
     "HEOMPINNLoss",
-    "LossTerms",
-    "LossWeights",
     "MLPSolution",
     "TrainingConfig",
     "TrainingResult",

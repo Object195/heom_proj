@@ -15,7 +15,6 @@ from heom.heom_rep import heom_state
 from model import (
     HEOMMLP,
     HEOMPINNLoss,
-    LossWeights,
     TrainingConfig,
     train_mlp,
 )
@@ -56,6 +55,7 @@ def main():
     model = HEOMMLP(
         hierarchy,
         hidden_sizes=MLP.hidden_sizes,
+        rho0=rho0,
         t_start=PSEUDOMODE.t_start,
         t_stop=PSEUDOMODE.t_stop,
         activation=MLP.activation,
@@ -64,13 +64,7 @@ def main():
     )
     objective = HEOMPINNLoss(
         hierarchy,
-        rho0,
         liouvillian=liouvillian,
-        weights=LossWeights(
-            dynamics=MLP.dynamics_weight,
-            initial_condition=MLP.initial_condition_weight,
-            trace=MLP.trace_weight,
-        ),
         dtype=dtype,
         device=device,
     )
@@ -92,7 +86,7 @@ def main():
     MLP_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), MLP_MODEL_PATH)
     print(f"Training time: {result.elapsed_seconds:.3f} s")
-    print(f"Final loss: {result.final.total:.6e}")
+    print(f"Final loss: {result.final.loss:.6e}")
     print(f"Saved MLP model: {MLP_MODEL_PATH}")
     return model, result
 

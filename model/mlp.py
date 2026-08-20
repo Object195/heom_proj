@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from heom import q_func
 from heom.heom_rep import heom_state
 
 
@@ -55,9 +56,10 @@ def _activation(name: str) -> nn.Module:
 class HEOMMLP(nn.Module):
     """Shared MLP evaluated at every BFS-ordered ADO coordinate.
 
-    ``forward(times)`` returns ``[U, V]`` with shape ``(batch, 2*N)``.
-    Both halves use ADO-major, column-major ordering, matching the sparse
-    Liouvillian from ``heom_state.build_Liouvillian``.
+    ``forward(times)`` returns the constrained physical state
+    ``initial_state + s * correction`` with shape ``(batch, 2*N)``. The real
+    and imaginary halves use ADO-major, column-major ordering, matching the
+    sparse Liouvillian from ``heom_state.build_Liouvillian``.
     """
 
     def __init__(
@@ -65,6 +67,7 @@ class HEOMMLP(nn.Module):
         hierarchy: heom_state,
         hidden_sizes: Sequence[int] = (64, 64, 64),
         *,
+        rho0,
         t_start: float,
         t_stop: float,
         activation: str = "tanh",
@@ -99,6 +102,34 @@ class HEOMMLP(nn.Module):
                 dtype=torch.long,
                 device=device,
             ),
+            persistent=False,
+        )
+        initial_complex = hierarchy.build_initial_state(rho0, as_sparse=False)
+        self.register_buffer(
+            "initial_state",
+            torch.as_tensor(
+                q_func.state_to_real(initial_complex),
+                dtype=dtype,
+                device=device,
+            ),
+        )
+        root_diagonal_indices = np.arange(self.system_dimension) * (
+            self.system_dimension + 1
+        )
+        self.register_buffer(
+            "root_diagonal_indices",
+            torch.as_tensor(
+                root_diagonal_indices,
+                dtype=torch.long,
+                device=device,
+            ),
+            persistent=False,
+        )
+        root_identity = np.zeros(self.state_size)
+        root_identity[root_diagonal_indices] = 1.0
+        self.register_buffer(
+            "root_identity",
+            torch.as_tensor(root_identity, dtype=dtype, device=device),
             persistent=False,
         )
 
@@ -174,9 +205,28 @@ class HEOMMLP(nn.Module):
         flat_v = matrix_to_column_vector(symmetric_v).reshape(-1, self.state_size)
         return flat_u, flat_v
 
-    def forward(self, times) -> torch.Tensor:
+    def state_correction(self, times) -> torch.Tensor:
+        """Return a partner-symmetric correction with traceless root ADO."""
         real_state, imaginary_state = self.symmetrize_raw(self.raw_output(times))
+        real_trace = real_state.index_select(
+            1, self.root_diagonal_indices
+        ).sum(dim=1, keepdim=True)
+        imaginary_trace = imaginary_state.index_select(
+            1, self.root_diagonal_indices
+        ).sum(dim=1, keepdim=True)
+        real_state = real_state - (
+            real_trace / self.system_dimension
+        ) * self.root_identity
+        imaginary_state = imaginary_state - (
+            imaginary_trace / self.system_dimension
+        ) * self.root_identity
         return torch.cat((real_state, imaginary_state), dim=-1)
+
+    def forward(self, times) -> torch.Tensor:
+        times = self.prepare_times(times)
+        normalized_times = self.normalize_times(times)
+        switch = 0.5 * (normalized_times + 1.0)
+        return self.initial_state + switch[:, None] * self.state_correction(times)
 
     def complex_states(self, times) -> torch.Tensor:
         real_state, imaginary_state = self(times).split(self.state_size, dim=-1)

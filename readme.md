@@ -40,6 +40,12 @@ liouvillian = hierarchy.build_Liouvillian(
 Physical pseudomode parameters and all MLP/training hyperparameters live in
 `experiment_parameters.py`.
 
+The MLP predicts a partner-symmetric HEOM correction rather than the complete
+state. Its root ADO is projected to be traceless, and the physical state is
+constructed as `initial_state + s * correction`, with normalized-time switch
+`s = (tau + 1) / 2`. The initial condition and unit trace are therefore exact,
+so training uses only the HEOM dynamical residual.
+
 Train and save the configured network to
 `saved_models/mlp/mlp_state_dict.pt` with:
 
