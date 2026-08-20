@@ -169,7 +169,7 @@ def train_mlp(
     callback: Callable[[EpochRecord], None] | None = None,
     verbose: bool = True,
 ) -> TrainingResult:
-    """Train on randomly jittered time-collocation minibatches."""
+    """Train with Adam minibatches or a fixed full-batch L-BFGS closure."""
     optimizer = optimizer or torch.optim.Adam(
         model.parameters(),
         lr=config.learning_rate,
@@ -178,7 +178,16 @@ def train_mlp(
     generator = torch.Generator(device=model.device)
     generator.manual_seed(config.seed)
     fixed_times = None
-    if not config.resample_each_epoch:
+    using_lbfgs = isinstance(optimizer, torch.optim.LBFGS)
+    if using_lbfgs:
+        fixed_times = torch.linspace(
+            config.t_start,
+            config.t_stop,
+            config.collocation_points,
+            dtype=model.dtype,
+            device=model.device,
+        )
+    elif not config.resample_each_epoch:
         fixed_times = _collocation_times(
             config,
             dtype=model.dtype,
@@ -198,26 +207,40 @@ def train_mlp(
                 device=model.device,
                 generator=generator,
             )
-        order = torch.randperm(
-            config.collocation_points,
-            device=model.device,
-            generator=generator,
-        )
-
         total = 0.0
-        for first in range(0, config.collocation_points, config.batch_size):
-            indices = order[first : first + config.batch_size]
-            batch_times = collocation_times[indices]
-            optimizer.zero_grad(set_to_none=True)
-            loss = objective(model, batch_times)
-            loss.backward()
-            if config.gradient_clip_norm is not None:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    config.gradient_clip_norm,
-                )
-            optimizer.step()
-            total += batch_times.numel() * loss.detach().item()
+        if using_lbfgs:
+            latest_loss = None
+
+            def closure():
+                nonlocal latest_loss
+                optimizer.zero_grad(set_to_none=True)
+                latest_loss = objective(model, collocation_times)
+                latest_loss.backward()
+                return latest_loss
+
+            optimizer.step(closure)
+            total = config.collocation_points * latest_loss.detach().item()
+        else:
+            order = torch.randperm(
+                config.collocation_points,
+                device=model.device,
+                generator=generator,
+            )
+            for first in range(
+                0, config.collocation_points, config.batch_size
+            ):
+                indices = order[first : first + config.batch_size]
+                batch_times = collocation_times[indices]
+                optimizer.zero_grad(set_to_none=True)
+                loss = objective(model, batch_times)
+                loss.backward()
+                if config.gradient_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        config.gradient_clip_norm,
+                    )
+                optimizer.step()
+                total += batch_times.numel() * loss.detach().item()
 
         record = EpochRecord(epoch, total / config.collocation_points)
         history.append(record)

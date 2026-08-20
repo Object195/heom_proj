@@ -53,6 +53,30 @@ Train and save the configured network to
 python -m model.train_mlp_model
 ```
 
+Continue training from that saved model with:
+
+```powershell
+python -m model.train_mlp_model --resume
+```
+
+Add `--plot-loss` to either command to display an interactive logarithmic
+loss curve during training. Resuming restores the network parameters and
+starts a new optimizer run with the configured learning rate.
+
+Use L-BFGS with a fixed full collocation batch, float64 arithmetic, and a
+strong-Wolfe line search with:
+
+```powershell
+python -m model.train_mlp_model --optimizer lbfgs --plot-loss
+```
+
+L-BFGS is the configured default. Set `MLP.optimizer` in
+`experiment_parameters.py`, or use `--optimizer adam`, to select Adam
+instead. The L-BFGS learning rate, iteration/evaluation limits, history
+size, and line search are configured in the same file. For L-BFGS, one
+reported epoch is one optimizer step (with any extra closure evaluations
+required by the line search).
+
 Run the three-trajectory comparison (explicit Lindbladian, sparse HEOM, and
 the saved MLP) with:
 

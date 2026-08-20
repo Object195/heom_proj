@@ -1,5 +1,7 @@
 """Scientific shape, ordering, residual, and autograd checks for the MLP."""
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import numpy as np
@@ -8,6 +10,7 @@ import torch
 from heom import q_func
 from heom.heom_rep import heom_state
 from model import (
+    EpochRecord,
     HEOMMLP,
     HEOMPINNLoss,
     TrainingConfig,
@@ -18,6 +21,12 @@ from model import (
     solve_mlp,
     state_and_time_derivative,
     train_mlp,
+)
+from model.train_mlp_model import (
+    LiveLossPlot,
+    build_argument_parser,
+    build_optimizer,
+    load_saved_model,
 )
 
 
@@ -332,3 +341,92 @@ def test_short_training_and_solution_layout():
         solution.primary_ados.conj().transpose(0, 2, 1),
         atol=1e-13,
     )
+
+
+def test_lbfgs_uses_fixed_full_batch_and_strong_wolfe():
+    assert build_argument_parser().parse_args([]).optimizer == "lbfgs"
+
+    hierarchy = make_hierarchy(depth=1)
+    liouvillian = hierarchy.build_Liouvillian(normalized=True)
+    model = HEOMMLP(
+        hierarchy,
+        hidden_sizes=(5,),
+        rho0=make_rho0(),
+        t_start=0.0,
+        t_stop=0.2,
+        dtype=torch.float64,
+    )
+    objective = HEOMPINNLoss(
+        hierarchy,
+        liouvillian=liouvillian,
+        dtype=torch.float64,
+    )
+    optimizer = build_optimizer(model, "lbfgs")
+    config = TrainingConfig(
+        t_start=0.0,
+        t_stop=0.2,
+        epochs=1,
+        collocation_points=5,
+        batch_size=2,
+        resample_each_epoch=True,
+    )
+
+    with patch.object(objective, "forward", wraps=objective.forward) as call:
+        result = train_mlp(
+            model,
+            objective,
+            config,
+            optimizer=optimizer,
+            verbose=False,
+        )
+
+    expected_times = torch.linspace(0.0, 0.2, 5, dtype=torch.float64)
+    assert isinstance(optimizer, torch.optim.LBFGS)
+    assert optimizer.defaults["line_search_fn"] == "strong_wolfe"
+    assert call.call_count >= 1
+    for invocation in call.call_args_list:
+        torch.testing.assert_close(invocation.args[1], expected_times)
+    assert np.isfinite(result.final.loss)
+
+
+def test_saved_model_can_be_loaded_for_additional_training():
+    hierarchy = make_hierarchy(depth=1)
+    model = HEOMMLP(
+        hierarchy,
+        hidden_sizes=(5,),
+        rho0=make_rho0(),
+        t_start=0.0,
+        t_stop=1.0,
+    )
+    expected = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+    }
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "mlp_state_dict.pt"
+        torch.save(model.state_dict(), path)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.add_(1.0)
+        load_saved_model(model, path, torch.device("cpu"))
+
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, expected[name])
+
+
+def test_live_loss_plot_uses_log_scale():
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    plotter = LiveLossPlot(update_every=100, final_epoch=201)
+    plotter(EpochRecord(epoch=1, loss=10.0))
+    plotter(EpochRecord(epoch=2, loss=1.0))
+    plotter(EpochRecord(epoch=100, loss=1.0))
+    plotter(EpochRecord(epoch=101, loss=0.5))
+    plotter(EpochRecord(epoch=201, loss=0.0))
+    plotter.finish(show=False)
+
+    assert plotter.axis.get_yscale() == "log"
+    np.testing.assert_array_equal(plotter.line.get_xdata(), [1, 100, 201])
+    assert np.all(np.asarray(plotter.line.get_ydata()) > 0.0)
+    plotter.plt.close(plotter.figure)
