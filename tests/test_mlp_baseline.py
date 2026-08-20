@@ -7,6 +7,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
+from experiment_parameters import MLP
 from heom import q_func
 from heom.heom_rep import heom_state
 from model import (
@@ -344,7 +345,12 @@ def test_short_training_and_solution_layout():
 
 
 def test_lbfgs_uses_fixed_full_batch_and_strong_wolfe():
-    assert build_argument_parser().parse_args([]).optimizer == "lbfgs"
+    arguments = build_argument_parser().parse_args(
+        ["--resume", "--plot-loss"]
+    )
+    assert arguments.resume
+    assert arguments.plot_loss
+    assert arguments.optimizer == "lbfgs"
 
     hierarchy = make_hierarchy(depth=1)
     liouvillian = hierarchy.build_Liouvillian(normalized=True)
@@ -383,6 +389,11 @@ def test_lbfgs_uses_fixed_full_batch_and_strong_wolfe():
     expected_times = torch.linspace(0.0, 0.2, 5, dtype=torch.float64)
     assert isinstance(optimizer, torch.optim.LBFGS)
     assert optimizer.defaults["line_search_fn"] == "strong_wolfe"
+    assert optimizer.defaults["tolerance_grad"] == MLP.lbfgs_tolerance_grad
+    assert (
+        optimizer.defaults["tolerance_change"]
+        == MLP.lbfgs_tolerance_change
+    )
     assert call.call_count >= 1
     for invocation in call.call_args_list:
         torch.testing.assert_close(invocation.args[1], expected_times)

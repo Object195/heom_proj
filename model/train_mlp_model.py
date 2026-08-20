@@ -87,6 +87,8 @@ def build_optimizer(model: HEOMMLP, name: str):
             max_iter=MLP.lbfgs_max_iter,
             max_eval=MLP.lbfgs_max_eval,
             history_size=MLP.lbfgs_history_size,
+            tolerance_grad=MLP.lbfgs_tolerance_grad,
+            tolerance_change=MLP.lbfgs_tolerance_change,
             line_search_fn=MLP.lbfgs_line_search,
         )
     return torch.optim.Adam(

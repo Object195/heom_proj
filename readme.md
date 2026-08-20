@@ -75,7 +75,8 @@ L-BFGS is the configured default. Set `MLP.optimizer` in
 instead. The L-BFGS learning rate, iteration/evaluation limits, history
 size, and line search are configured in the same file. For L-BFGS, one
 reported epoch is one optimizer step (with any extra closure evaluations
-required by the line search).
+required by the line search). The stopping thresholds are exposed as
+`lbfgs_tolerance_grad` and `lbfgs_tolerance_change`.
 
 Run the three-trajectory comparison (explicit Lindbladian, sparse HEOM, and
 the saved MLP) with:

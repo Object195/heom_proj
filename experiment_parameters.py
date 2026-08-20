@@ -30,21 +30,23 @@ class MLPParameters:
     activation: str = "tanh"
     dtype: str = "float64"
     device: str = "cuda"
-    epochs: int = 1000
+    epochs: int = 100
     collocation_points: int = 512
     batch_size: int = 64
     optimizer: str = "lbfgs"
     learning_rate: float = 1e-4
     weight_decay: float = 0.0
     lbfgs_learning_rate: float = 1.0
-    lbfgs_max_iter: int = 1
-    lbfgs_max_eval: int = 20
+    lbfgs_max_iter: int = 50
+    lbfgs_max_eval: int = 50
     lbfgs_history_size: int = 100
+    lbfgs_tolerance_grad: float = 1e-12
+    lbfgs_tolerance_change: float = 1e-14
     lbfgs_line_search: str = "strong_wolfe"
     gradient_clip_norm: float | None = None
     resample_each_epoch: bool = True
     seed: int = 0
-    log_every: int = 100
+    log_every: int = 10
     inference_batch_size: int = 1024
 
 
