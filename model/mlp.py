@@ -65,6 +65,8 @@ class HEOMMLP(nn.Module):
         hierarchy: heom_state,
         hidden_sizes: Sequence[int] = (64, 64, 64),
         *,
+        t_start: float,
+        t_stop: float,
         activation: str = "tanh",
         dtype: torch.dtype = torch.float64,
         device: torch.device | str | None = None,
@@ -78,6 +80,8 @@ class HEOMMLP(nn.Module):
         self.system_size = self.system_dimension**2
         self.state_size = self.n_ados * self.system_size
         self.input_size = 2 * (hierarchy.K + 1) + 1
+        self.t_start = float(t_start)
+        self.t_stop = float(t_stop)
 
         self.register_buffer(
             "ado_coordinates",
@@ -126,17 +130,29 @@ class HEOMMLP(nn.Module):
         return self.ado_coordinates.device
 
     def prepare_times(self, times) -> torch.Tensor:
+        """Convert physical times to a flat tensor on the model device."""
         return torch.as_tensor(
             times,
             dtype=self.dtype,
             device=self.device,
         ).reshape(-1)
 
+    def normalize_times(self, times) -> torch.Tensor:
+        """Map physical time from ``[t_start, t_stop]`` to ``[-1, 1]``."""
+        times = self.prepare_times(times)
+        return 2.0 * (times - self.t_start) / (
+            self.t_stop - self.t_start
+        ) - 1.0
+
     def coordinate_inputs(self, times) -> torch.Tensor:
         """Build the ``(batch, nADO, 2*K+3)`` MLP input tensor."""
-        times = self.prepare_times(times)
-        coordinates = self.ado_coordinates.expand(times.numel(), -1, -1)
-        time_column = times[:, None, None].expand(-1, self.n_ados, 1)
+        normalized_times = self.normalize_times(times)
+        coordinates = self.ado_coordinates.expand(
+            normalized_times.numel(), -1, -1
+        )
+        time_column = normalized_times[:, None, None].expand(
+            -1, self.n_ados, 1
+        )
         return torch.cat((coordinates, time_column), dim=-1)
 
     def raw_output(self, times) -> torch.Tensor:
@@ -186,7 +202,11 @@ def state_and_time_derivative(
     *,
     create_graph: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Evaluate the state and its time derivative with one batched JVP."""
+    """Evaluate the state and its derivative with respect to physical time.
+
+    ``HEOMMLP.forward`` normalizes time internally. Differentiating the
+    composed model here includes the corresponding chain-rule factor.
+    """
     times = model.prepare_times(times)
     return torch.autograd.functional.jvp(
         model,

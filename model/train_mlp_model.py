@@ -56,6 +56,8 @@ def main():
     model = HEOMMLP(
         hierarchy,
         hidden_sizes=MLP.hidden_sizes,
+        t_start=PSEUDOMODE.t_start,
+        t_stop=PSEUDOMODE.t_stop,
         activation=MLP.activation,
         dtype=dtype,
         device=device,

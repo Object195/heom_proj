@@ -36,9 +36,9 @@ def run_lindbladian(t_eval):
     sx_full = tensor(sigmax(), qeye(PSEUDOMODE.cavity_dimension))
     h_system = 0.5 * PSEUDOMODE.delta * sz_full
     h_system += 0.5 * PSEUDOMODE.v * sx_full
-    h_cavity = PSEUDOMODE.w0 * annihilation.dag() * annihilation
+    h_cavity = PSEUDOMODE.w0 * (annihilation.dag() @ annihilation)
     h_interaction = (
-        PSEUDOMODE.g * sz_full * (annihilation + annihilation.dag())
+        PSEUDOMODE.g * (sz_full @ (annihilation + annihilation.dag()))
     )
     h_total = h_system + h_cavity + h_interaction
     collapse_operators = [np.sqrt(PSEUDOMODE.gamma) * annihilation]
@@ -52,18 +52,18 @@ def run_lindbladian(t_eval):
         h_total,
         psi0,
         t_eval,
-        collapse_operators,
-        [sz_full],
+        c_ops=collapse_operators,
+        e_ops={"sz": sz_full},
     )
     print(f"Lindbladian propagation: {perf_counter() - start:.3f} s")
-    return np.real(result.expect[0])
+    return np.asarray(result.e_data["sz"]).real
 
 
 def build_normalized_hard_heom():
     """Build the normalized, hard-truncated free-pole HEOM."""
     h_system = 0.5 * PSEUDOMODE.delta * sigmaz().full()
     h_system += 0.5 * PSEUDOMODE.v * sigmax().full()
-    rho0 = (basis(2, 0) * basis(2, 0).dag()).full()
+    rho0 = basis(2, 0).proj().full()
     frequencies = np.array(
         [0.5 * PSEUDOMODE.gamma + 1j * PSEUDOMODE.w0],
         dtype=np.complex128,
@@ -115,6 +115,8 @@ def load_mlp(hierarchy):
     model = HEOMMLP(
         hierarchy,
         hidden_sizes=MLP.hidden_sizes,
+        t_start=PSEUDOMODE.t_start,
+        t_stop=PSEUDOMODE.t_stop,
         activation=MLP.activation,
         dtype=getattr(torch, MLP.dtype),
         device=device,
@@ -127,6 +129,7 @@ def load_mlp(hierarchy):
 
 
 def run_mlp_solver(model, t_eval):
+    """Evaluate at physical times; ``HEOMMLP`` normalizes them internally."""
     start = perf_counter()
     result = solve_mlp(
         model,

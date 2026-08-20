@@ -14,7 +14,6 @@ if str(PROJECT_ROOT) not in sys.path:
 import matplotlib.pyplot as plt
 import numpy as np
 from qutip import (
-    Options,
     basis,
     destroy,
     mesolve,
@@ -23,7 +22,7 @@ from qutip import (
     sigmaz,
     tensor,
 )
-from qutip.nonmarkov.heom import BosonicBath, HEOMSolver
+from qutip.solver.heom import BosonicBath, HEOMSolver
 
 from experiment_parameters import PSEUDOMODE
 from heom.heom_rep import heom_state
@@ -44,15 +43,18 @@ tlist = np.linspace(
 )
 
 
-def run_pseudomode_model():
+def run_pseudomode_model(t_eval=None):
     """Simulate the explicitly damped cavity pseudomode."""
+    if t_eval is None:
+        t_eval = tlist
+
     a = tensor(qeye(2), destroy(cavity_dimension))
     sz_full = tensor(sigmaz(), qeye(cavity_dimension))
     sx_full = tensor(sigmax(), qeye(cavity_dimension))
 
     h_system = 0.5 * Delta * sz_full + 0.5 * V * sx_full
-    h_cavity = w0 * a.dag() * a
-    h_interaction = g * sz_full * (a + a.dag())
+    h_cavity = w0 * (a.dag() @ a)
+    h_interaction = g * (sz_full @ (a + a.dag()))
     h_total = h_system + h_cavity + h_interaction
 
     collapse_operators = [np.sqrt(gamma) * a]
@@ -62,13 +64,13 @@ def run_pseudomode_model():
     result = mesolve(
         h_total,
         psi0,
-        tlist,
-        collapse_operators,
-        [sz_full],
+        t_eval,
+        c_ops=collapse_operators,
+        e_ops={"sz": sz_full},
     )
     elapsed = perf_counter() - start
     print(f"Pseudomode Lindblad propagation: {elapsed:.3f} s")
-    return np.real(result.expect[0])
+    return np.asarray(result.e_data["sz"]).real
 
 
 def pseudomode_bath_expansion():
@@ -93,10 +95,15 @@ def free_pole_bath_expansion():
     return frequencies, coefficients
 
 
-def run_qutip_heom():
+def run_qutip_heom(t_eval=None, depths=None):
     """Simulate the reduced spin with QuTiP's HEOM implementation."""
+    if t_eval is None:
+        t_eval = tlist
+    if depths is None:
+        depths = depth_list
+
     h_system = 0.5 * Delta * sigmaz() + 0.5 * V * sigmax()
-    rho0 = basis(2, 0) * basis(2, 0).dag()
+    rho0 = basis(2, 0).proj()
     frequencies, coefficients_real, coefficients_imag = (
         pseudomode_bath_expansion()
     )
@@ -108,15 +115,16 @@ def run_qutip_heom():
         coefficients_imag,
         frequencies,
     )
-    options = Options(
-        method="bdf",
-        nsteps=1_000_000,
-        rtol=PSEUDOMODE.rtol,
-        atol=PSEUDOMODE.atol,
-    )
+    options = {
+        "method": "bdf",
+        "nsteps": 1_000_000,
+        "rtol": PSEUDOMODE.rtol,
+        "atol": PSEUDOMODE.atol,
+        "progress_bar": "",
+    }
 
     trajectories = {}
-    for max_depth in depth_list:
+    for max_depth in depths:
         solver = HEOMSolver(
             h_system,
             bath,
@@ -124,10 +132,10 @@ def run_qutip_heom():
             options=options,
         )
         start = perf_counter()
-        result = solver.run(rho0, tlist, e_ops=[sigmaz()])
+        result = solver.run(rho0, t_eval, e_ops={"sz": sigmaz()})
         elapsed = perf_counter() - start
         print(f"QuTiP HEOM propagation (L={max_depth}): {elapsed:.3f} s")
-        trajectories[max_depth] = np.real(result.expect[0])
+        trajectories[max_depth] = np.asarray(result.e_data["sz"]).real
     return trajectories
 
 
@@ -206,7 +214,7 @@ def run_sparse_heom(
     """
     h_system = 0.5 * Delta * sigmaz().full() + 0.5 * V * sigmax().full()
     coupling_operator = sigmaz().full()
-    rho0 = (basis(2, 0) * basis(2, 0).dag()).full()
+    rho0 = basis(2, 0).proj().full()
     frequencies, coefficients = free_pole_bath_expansion()
 
     model = heom_state(

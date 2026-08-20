@@ -125,11 +125,14 @@ class HEOMPINNLoss(nn.Module):
         time_derivative: torch.Tensor,
     ) -> torch.Tensor:
         residual = time_derivative - self.rhs(state)
-        return residual.square().sum() / (self.state_size * state.shape[0])
+        return residual.square().sum() / (self.state_size)
 
-    def initial_condition_loss(self, model: HEOMMLP, q_x: int) -> torch.Tensor:
-        prediction = model(self.initial_state.new_zeros(1))[0]
-        return (prediction - self.initial_state).square().sum() / q_x
+    def initial_condition_loss(self, model: HEOMMLP) -> torch.Tensor:
+        initial_time = self.initial_state.new_tensor([model.t_start])
+        prediction = model(initial_time)[0]
+        return (
+            prediction - self.initial_state
+        ).square().sum() / self.state_size
 
     def trace_loss(self, state: torch.Tensor) -> torch.Tensor:
         root_trace = state[:, : self.state_size].index_select(
@@ -147,11 +150,10 @@ class HEOMPINNLoss(nn.Module):
     ) -> LossTerms:
         times = model.prepare_times(times)
         batch_size = times.numel()
-        q_x = batch_size if q_x is None else q_x
         state, time_derivative = state_and_time_derivative(model, times)
-        dynamics = self.dynamics_loss(state, time_derivative)
-        initial_condition = self.initial_condition_loss(model, q_x)
-        trace = (q_x / batch_size) * self.trace_loss(state)
+        dynamics = self.dynamics_loss(state, time_derivative)/ batch_size
+        initial_condition = self.initial_condition_loss(model)
+        trace = self.trace_loss(state)/ batch_size
         total = (
             self.weights.dynamics * dynamics
             + self.weights.initial_condition * initial_condition
@@ -335,7 +337,7 @@ def solve_mlp(
     *,
     batch_size: int = 1_024,
 ) -> MLPSolution:
-    """Evaluate a trained model on an output time grid."""
+    """Evaluate on a physical-time grid; the model normalizes internally."""
     t_eval = np.asarray(t_eval, dtype=np.float64)
     was_training = model.training
     model.eval()

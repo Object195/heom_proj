@@ -13,12 +13,12 @@ class PseudomodeParameters:
     delta: float = 1.0
     v: float = 0.1
     g: float = 0.1
-    gamma: float = 0.1
+    gamma: float = 1
     cavity_dimension: int = 20
     heom_depth: int = 5
     qutip_depths: tuple[int, ...] = (5,)
     t_start: float = 0.0
-    t_stop: float = 100.0
+    t_stop: float = 100
     n_times: int = 1_000
     rtol: float = 1e-8
     atol: float = 1e-10
@@ -29,7 +29,7 @@ class MLPParameters:
     hidden_sizes: tuple[int, ...] = (64, 64, 64, 64)
     activation: str = "tanh"
     dtype: str = "float64"
-    device: str = "cpu"
+    device: str = "cuda"
     epochs: int = 2000
     collocation_points: int = 512
     batch_size: int = 64
@@ -39,9 +39,9 @@ class MLPParameters:
     resample_each_epoch: bool = True
     seed: int = 0
     log_every: int = 100
-    dynamics_weight: float = 1
+    dynamics_weight: float = 2
     initial_condition_weight: float = 1
-    trace_weight: float = 1
+    trace_weight: float = 0.5
     inference_batch_size: int = 1024
 
 
