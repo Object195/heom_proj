@@ -117,6 +117,8 @@ class TrainingConfig:
 class EpochRecord:
     epoch: int
     loss: float
+    gradient_inf: float | None = None
+    parameter_change_inf: float | None = None
 
 
 @dataclass(frozen=True)
@@ -199,6 +201,20 @@ def train_mlp(
     history = []
     start_time = perf_counter()
     for epoch in range(1, config.epochs + 1):
+        log_epoch = (
+            epoch == 1
+            or epoch % config.log_every == 0
+            or epoch == config.epochs
+        )
+        report_lbfgs_diagnostics = using_lbfgs and verbose and log_epoch
+        parameters_before = (
+            tuple(
+                parameter.detach().clone()
+                for parameter in model.parameters()
+            )
+            if report_lbfgs_diagnostics
+            else None
+        )
         collocation_times = fixed_times
         if collocation_times is None:
             collocation_times = _collocation_times(
@@ -219,8 +235,29 @@ def train_mlp(
                 return latest_loss
 
             optimizer.step(closure)
+            gradient_inf = None
+            parameter_change_inf = None
+            if report_lbfgs_diagnostics:
+                latest_loss = closure()
+                gradient_inf = torch.stack(
+                    [
+                        parameter.grad.detach().abs().amax()
+                        for parameter in model.parameters()
+                        if parameter.grad is not None
+                    ]
+                ).amax().item()
+                parameter_change_inf = torch.stack(
+                    [
+                        (parameter.detach() - previous).abs().amax()
+                        for parameter, previous in zip(
+                            model.parameters(), parameters_before
+                        )
+                    ]
+                ).amax().item()
             total = config.collocation_points * latest_loss.detach().item()
         else:
+            gradient_inf = None
+            parameter_change_inf = None
             order = torch.randperm(
                 config.collocation_points,
                 device=model.device,
@@ -242,19 +279,27 @@ def train_mlp(
                 optimizer.step()
                 total += batch_times.numel() * loss.detach().item()
 
-        record = EpochRecord(epoch, total / config.collocation_points)
+        record = EpochRecord(
+            epoch,
+            total / config.collocation_points,
+            gradient_inf,
+            parameter_change_inf,
+        )
         history.append(record)
         if callback is not None:
             callback(record)
-        if verbose and (
-            epoch == 1
-            or epoch % config.log_every == 0
-            or epoch == config.epochs
-        ):
-            print(
+        if verbose and log_epoch:
+            message = (
                 f"Epoch {epoch:6d}/{config.epochs}: "
                 f"loss={record.loss:.6e}"
             )
+            if using_lbfgs:
+                message += (
+                    f"  g_inf={record.gradient_inf:.6e}"
+                    "  "
+                    f"delta_theta_inf={record.parameter_change_inf:.6e}"
+                )
+            print(message)
 
     return TrainingResult(
         history=tuple(history),

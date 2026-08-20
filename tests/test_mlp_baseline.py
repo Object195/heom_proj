@@ -368,6 +368,9 @@ def test_lbfgs_uses_fixed_full_batch_and_strong_wolfe():
         dtype=torch.float64,
     )
     optimizer = build_optimizer(model, "lbfgs")
+    parameters_before = tuple(
+        parameter.detach().clone() for parameter in model.parameters()
+    )
     config = TrainingConfig(
         t_start=0.0,
         t_stop=0.2,
@@ -377,13 +380,15 @@ def test_lbfgs_uses_fixed_full_batch_and_strong_wolfe():
         resample_each_epoch=True,
     )
 
-    with patch.object(objective, "forward", wraps=objective.forward) as call:
+    with (
+        patch.object(objective, "forward", wraps=objective.forward) as call,
+        patch("builtins.print") as printed,
+    ):
         result = train_mlp(
             model,
             objective,
             config,
             optimizer=optimizer,
-            verbose=False,
         )
 
     expected_times = torch.linspace(0.0, 0.2, 5, dtype=torch.float64)
@@ -397,6 +402,27 @@ def test_lbfgs_uses_fixed_full_batch_and_strong_wolfe():
     assert call.call_count >= 1
     for invocation in call.call_args_list:
         torch.testing.assert_close(invocation.args[1], expected_times)
+    expected_parameter_change = max(
+        (parameter.detach() - previous).abs().amax().item()
+        for parameter, previous in zip(model.parameters(), parameters_before)
+    )
+    optimizer.zero_grad(set_to_none=True)
+    final_loss = objective(model, expected_times)
+    final_loss.backward()
+    expected_gradient = max(
+        parameter.grad.detach().abs().amax().item()
+        for parameter in model.parameters()
+        if parameter.grad is not None
+    )
+    assert np.isclose(
+        result.final.parameter_change_inf,
+        expected_parameter_change,
+    )
+    assert np.isclose(result.final.gradient_inf, expected_gradient)
+    assert np.isclose(result.final.loss, final_loss.detach().item())
+    message = printed.call_args.args[0]
+    assert "g_inf=" in message
+    assert "delta_theta_inf=" in message
     assert np.isfinite(result.final.loss)
 
 

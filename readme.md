@@ -78,6 +78,11 @@ reported epoch is one optimizer step (with any extra closure evaluations
 required by the line search). The stopping thresholds are exposed as
 `lbfgs_tolerance_grad` and `lbfgs_tolerance_change`.
 
+Each L-BFGS training log also reports the post-step full-batch maximum
+gradient norm `g_inf` and the maximum parameter change for that optimizer
+step, `delta_theta_inf`. Computing the post-step gradient adds one full-batch
+loss and backward evaluation only on logged epochs.
+
 Run the three-trajectory comparison (explicit Lindbladian, sparse HEOM, and
 the saved MLP) with:
 
