@@ -346,7 +346,7 @@ def test_short_training_and_solution_layout():
 
 def test_lbfgs_uses_fixed_full_batch_and_strong_wolfe():
     arguments = build_argument_parser().parse_args(
-        ["--resume", "--plot-loss"]
+        ["--resume", "--plot-loss", "--optimizer", "lbfgs"]
     )
     assert arguments.resume
     assert arguments.plot_loss
@@ -394,6 +394,7 @@ def test_lbfgs_uses_fixed_full_batch_and_strong_wolfe():
     expected_times = torch.linspace(0.0, 0.2, 5, dtype=torch.float64)
     assert isinstance(optimizer, torch.optim.LBFGS)
     assert optimizer.defaults["line_search_fn"] == "strong_wolfe"
+    assert optimizer.defaults["max_eval"] == MLP.lbfgs_max_eval
     assert optimizer.defaults["tolerance_grad"] == MLP.lbfgs_tolerance_grad
     assert (
         optimizer.defaults["tolerance_change"]
@@ -423,7 +424,59 @@ def test_lbfgs_uses_fixed_full_batch_and_strong_wolfe():
     message = printed.call_args.args[0]
     assert "g_inf=" in message
     assert "delta_theta_inf=" in message
+    assert "lbfgs_iter=" in message
+    assert "evals=" in message
+    assert "history=" in message
+    assert result.final.lbfgs_iterations is not None
+    assert result.final.lbfgs_evaluations is not None
+    assert result.final.lbfgs_curvature_pairs is not None
     assert np.isfinite(result.final.loss)
+
+
+def test_lbfgs_optimizes_residual_sum_but_reports_mean_loss():
+    hierarchy = make_hierarchy(depth=1)
+    liouvillian = hierarchy.build_Liouvillian(normalized=True)
+    model = HEOMMLP(
+        hierarchy,
+        hidden_sizes=(5,),
+        rho0=make_rho0(),
+        t_start=0.0,
+        t_stop=0.2,
+        dtype=torch.float64,
+    )
+    objective = HEOMPINNLoss(
+        hierarchy,
+        liouvillian=liouvillian,
+        dtype=torch.float64,
+    )
+    optimizer = build_optimizer(model, "lbfgs")
+    config = TrainingConfig(
+        t_start=0.0,
+        t_stop=0.2,
+        epochs=1,
+        collocation_points=5,
+        batch_size=5,
+    )
+    observed_optimizer_loss = None
+
+    def one_closure_step(closure):
+        nonlocal observed_optimizer_loss
+        observed_optimizer_loss = closure().detach().item()
+
+    with patch.object(optimizer, "step", side_effect=one_closure_step):
+        result = train_mlp(
+            model,
+            objective,
+            config,
+            optimizer=optimizer,
+            verbose=False,
+        )
+
+    times = torch.linspace(0.0, 0.2, 5, dtype=torch.float64)
+    mean_loss = objective(model, times).detach().item()
+    expected_scale = objective.state_size * times.numel()
+    assert np.isclose(result.final.loss, mean_loss)
+    assert np.isclose(observed_optimizer_loss, expected_scale * mean_loss)
 
 
 def test_saved_model_can_be_loaded_for_additional_training():

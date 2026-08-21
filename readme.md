@@ -37,8 +37,9 @@ liouvillian = hierarchy.build_Liouvillian(
 )
 ```
 
-Physical pseudomode parameters and all MLP/training hyperparameters live in
-`experiment_parameters.py`.
+Physical pseudomode parameters and all MLP/training hyperparameters in
+`experiment_parameters.py` are the immutable defaults. A sparse TOML file can
+override only the values needed for one run without editing that module.
 
 The MLP predicts a partner-symmetric HEOM correction rather than the complete
 state. Its root ADO is projected to be traceless, and the physical state is
@@ -59,6 +60,67 @@ Continue training from that saved model with:
 python -m model.train_mlp_model --resume
 ```
 
+### Sparse overrides and training sequences
+
+Use `training_sequence.example.toml` as a starting point for a staged run:
+
+```powershell
+python -m model.train_mlp_model --sequence training_sequence.toml
+```
+
+The file has three layers. Omitted values always come from
+`experiment_parameters.py`:
+
+```toml
+[pseudomode]
+g = 0.2
+
+[mlp]
+device = "cuda"
+dtype = "float64"
+collocation_points = 512
+
+[[sessions]]
+name = "adam_warmup"
+[sessions.mlp]
+optimizer = "adam"
+epochs = 100
+learning_rate = 1e-3
+
+[[sessions]]
+name = "lbfgs_refinement"
+[sessions.mlp]
+optimizer = "lbfgs"
+epochs = 25
+collocation_points = 1024
+```
+
+Top-level `[pseudomode]` and `[mlp]` values form the shared experiment. Each
+`[sessions.mlp]` table is a sparse override of that same shared MLP config, so
+a setting from one session does not accidentally leak into the next. Model
+weights do carry forward: the hierarchy, objective, and network are built
+once, each session gets a fresh optimizer, and the checkpoint is updated after
+every successful session. Checkpoint replacement is atomic, so an interrupted
+save does not destroy the previous stage. Put architecture, dtype/device, time
+interval, and physical changes at the top level; changing them inside a
+session is rejected because it would make in-memory weight reuse ambiguous.
+Because every stage shares one network dtype, a sequence containing L-BFGS
+must use top-level `dtype = "float64"` (the default).
+
+A TOML file with only top-level overrides runs one session. `--config` is an
+alias for `--sequence`, and `--resume` loads the checkpoint once before the
+first session. The legacy `--optimizer` option remains available for a
+single run, but cannot be combined with a sequence whose sessions select their
+own optimizers. Unknown or misspelled fields are reported before training.
+Use `--model-path runs/experiment_a.pt` to keep experiments in separate
+checkpoints; `--resume` checks saved physics and model-construction metadata
+before loading.
+
+Each checkpoint has a versioned `<checkpoint>.config.json` sidecar containing
+the fully resolved parameters. This makes runs reproducible and lets the
+benchmark reconstruct the exact physics and network even after the defaults
+change.
+
 Add `--plot-loss` to either command to display an interactive logarithmic
 loss curve during training. Resuming restores the network parameters and
 starts a new optimizer run with the configured learning rate.
@@ -70,11 +132,11 @@ strong-Wolfe line search with:
 python -m model.train_mlp_model --optimizer lbfgs --plot-loss
 ```
 
-L-BFGS is the configured default. Set `MLP.optimizer` in
-`experiment_parameters.py`, or use `--optimizer adam`, to select Adam
-instead. The L-BFGS learning rate, iteration/evaluation limits, history
-size, and line search are configured in the same file. For L-BFGS, one
-reported epoch is one optimizer step (with any extra closure evaluations
+L-BFGS is the configured default. Use `--optimizer adam` for a single run, or
+set `optimizer = "adam"` in a sequence session. The L-BFGS learning rate,
+iteration/evaluation limits, history size, and line search can likewise be
+overridden sparsely. For L-BFGS, one reported epoch is one optimizer step
+(with any extra closure evaluations
 required by the line search). The stopping thresholds are exposed as
 `lbfgs_tolerance_grad` and `lbfgs_tolerance_change`.
 
@@ -91,7 +153,30 @@ python -m benchmark.benchmark_mlp
 ```
 
 The benchmark performs no training. It reconstructs the configured MLP,
-loads the saved state dictionary, and evaluates the trajectory.
+loads the saved state dictionary, and evaluates the trajectory. It reads the
+checkpoint sidecar automatically. For a legacy checkpoint without a sidecar,
+it falls back to `experiment_parameters.py`; the source TOML can be supplied
+explicitly with `--sequence`, and a non-default checkpoint with
+`--model-path`:
+
+```powershell
+python -m benchmark.benchmark_mlp --model-path runs/experiment_a.pt
+python -m benchmark.benchmark_mlp --sequence training_sequence.example.toml
+```
+
+To evaluate forward time-domain generalization without changing the model's
+stored training-time normalization, provide a custom benchmark interval and
+sampling count. For example, a model trained on `[0, 10]` can be evaluated on
+`[0, 20]` with:
+
+```powershell
+python -m benchmark.benchmark_mlp --t-stop 20 --n-times 2000
+```
+
+The benchmark may also start later, such as `--t-start 10 --t-stop 20`. The
+numerical references still propagate from the original initial time before
+returning the requested interval, so the physical state is not reset at
+`t=10`.
 
 The neural pipeline requires PyTorch. The benchmarks additionally use QuTiP
 and Matplotlib.

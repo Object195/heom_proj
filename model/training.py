@@ -119,6 +119,9 @@ class EpochRecord:
     loss: float
     gradient_inf: float | None = None
     parameter_change_inf: float | None = None
+    lbfgs_iterations: int | None = None
+    lbfgs_evaluations: int | None = None
+    lbfgs_curvature_pairs: int | None = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +184,7 @@ def train_mlp(
     generator.manual_seed(config.seed)
     fixed_times = None
     using_lbfgs = isinstance(optimizer, torch.optim.LBFGS)
+    lbfgs_loss_scale = None
     if using_lbfgs:
         fixed_times = torch.linspace(
             config.t_start,
@@ -189,6 +193,13 @@ def train_mlp(
             dtype=model.dtype,
             device=model.device,
         )
+        # HEOMPINNLoss reports a mean residual so results remain comparable
+        # across hierarchy and collocation-grid sizes.  PyTorch L-BFGS uses an
+        # absolute y^T s > 1e-10 safeguard for accepting curvature pairs; the
+        # tiny mean-loss scale can therefore leave its history permanently
+        # empty.  Optimize the equivalent residual sum while retaining the
+        # normalized mean for reporting and convergence diagnostics.
+        lbfgs_loss_scale = objective.state_size * fixed_times.numel()
     elif not config.resample_each_epoch:
         fixed_times = _collocation_times(
             config,
@@ -225,20 +236,41 @@ def train_mlp(
             )
         total = 0.0
         if using_lbfgs:
-            latest_loss = None
+            first_parameter = optimizer.param_groups[0]["params"][0]
+            optimizer_state = optimizer.state[first_parameter]
+            evaluations_before = int(optimizer_state.get("func_evals", 0))
+            iterations_before = int(optimizer_state.get("n_iter", 0))
 
             def closure():
-                nonlocal latest_loss
                 optimizer.zero_grad(set_to_none=True)
-                latest_loss = objective(model, collocation_times)
-                latest_loss.backward()
-                return latest_loss
+                mean_loss = objective(model, collocation_times)
+                optimizer_loss = lbfgs_loss_scale * mean_loss
+                optimizer_loss.backward()
+                return optimizer_loss
 
             optimizer.step(closure)
+            optimizer_state = optimizer.state[first_parameter]
+            lbfgs_evaluations = (
+                int(optimizer_state.get("func_evals", evaluations_before))
+                - evaluations_before
+            )
+            lbfgs_iterations = (
+                int(optimizer_state.get("n_iter", iterations_before))
+                - iterations_before
+            )
+            lbfgs_curvature_pairs = len(
+                optimizer_state.get("old_dirs", ())
+            )
+
+            # Evaluate the normalized objective at the final parameters.
+            # Gradients from the scaled closure are deliberately discarded so
+            # g_inf remains comparable with Adam runs and earlier checkpoints.
+            optimizer.zero_grad(set_to_none=True)
+            latest_loss = objective(model, collocation_times)
             gradient_inf = None
             parameter_change_inf = None
             if report_lbfgs_diagnostics:
-                latest_loss = closure()
+                latest_loss.backward()
                 gradient_inf = torch.stack(
                     [
                         parameter.grad.detach().abs().amax()
@@ -258,6 +290,9 @@ def train_mlp(
         else:
             gradient_inf = None
             parameter_change_inf = None
+            lbfgs_iterations = None
+            lbfgs_evaluations = None
+            lbfgs_curvature_pairs = None
             order = torch.randperm(
                 config.collocation_points,
                 device=model.device,
@@ -284,6 +319,9 @@ def train_mlp(
             total / config.collocation_points,
             gradient_inf,
             parameter_change_inf,
+            lbfgs_iterations,
+            lbfgs_evaluations,
+            lbfgs_curvature_pairs,
         )
         history.append(record)
         if callback is not None:
@@ -298,6 +336,12 @@ def train_mlp(
                     f"  g_inf={record.gradient_inf:.6e}"
                     "  "
                     f"delta_theta_inf={record.parameter_change_inf:.6e}"
+                    "  "
+                    f"lbfgs_iter={record.lbfgs_iterations}"
+                    "  "
+                    f"evals={record.lbfgs_evaluations}"
+                    "  "
+                    f"history={record.lbfgs_curvature_pairs}"
                 )
             print(message)
 

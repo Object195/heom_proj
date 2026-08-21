@@ -1,0 +1,83 @@
+{
+  "base_mlp": {
+    "activation": "tanh",
+    "batch_size": 64,
+    "collocation_points": 512,
+    "device": "cuda",
+    "dtype": "float64",
+    "epochs": 200,
+    "gradient_clip_norm": null,
+    "hidden_sizes": [
+      64,
+      64,
+      64,
+      64
+    ],
+    "inference_batch_size": 1024,
+    "lbfgs_history_size": 100,
+    "lbfgs_learning_rate": 1.0,
+    "lbfgs_line_search": "strong_wolfe",
+    "lbfgs_max_eval": 100,
+    "lbfgs_max_iter": 50,
+    "lbfgs_tolerance_change": 1e-14,
+    "lbfgs_tolerance_grad": 1e-12,
+    "learning_rate": 0.001,
+    "log_every": 20,
+    "optimizer": "lbfgs",
+    "resample_each_epoch": true,
+    "seed": 0,
+    "weight_decay": 0.0
+  },
+  "format_version": 1,
+  "pseudomode": {
+    "atol": 1e-10,
+    "cavity_dimension": 20,
+    "delta": 1.0,
+    "g": 0.1,
+    "gamma": 1,
+    "heom_depth": 5,
+    "n_times": 1000,
+    "qutip_depths": [
+      5
+    ],
+    "rtol": 1e-08,
+    "t_start": 0.0,
+    "t_stop": 10,
+    "v": 0.1,
+    "w0": 1.0
+  },
+  "sessions": [
+    {
+      "mlp": {
+        "activation": "tanh",
+        "batch_size": 64,
+        "collocation_points": 512,
+        "device": "cuda",
+        "dtype": "float64",
+        "epochs": 200,
+        "gradient_clip_norm": null,
+        "hidden_sizes": [
+          64,
+          64,
+          64,
+          64
+        ],
+        "inference_batch_size": 1024,
+        "lbfgs_history_size": 100,
+        "lbfgs_learning_rate": 1.0,
+        "lbfgs_line_search": "strong_wolfe",
+        "lbfgs_max_eval": 100,
+        "lbfgs_max_iter": 50,
+        "lbfgs_tolerance_change": 1e-14,
+        "lbfgs_tolerance_grad": 1e-12,
+        "learning_rate": 0.001,
+        "log_every": 20,
+        "optimizer": "lbfgs",
+        "resample_each_epoch": true,
+        "seed": 0,
+        "weight_decay": 0.0
+      },
+      "name": "default"
+    }
+  ]
+}

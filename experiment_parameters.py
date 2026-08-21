@@ -30,15 +30,16 @@ class MLPParameters:
     activation: str = "tanh"
     dtype: str = "float64"
     device: str = "cuda"
-    epochs: int = 100
+    epochs: int = 200
     collocation_points: int = 512
     batch_size: int = 64
+    #optimizer: str = "adam"
     optimizer: str = "lbfgs"
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-3
     weight_decay: float = 0.0
     lbfgs_learning_rate: float = 1.0
     lbfgs_max_iter: int = 50
-    lbfgs_max_eval: int = 50
+    lbfgs_max_eval: int = 100
     lbfgs_history_size: int = 100
     lbfgs_tolerance_grad: float = 1e-12
     lbfgs_tolerance_change: float = 1e-14
@@ -46,7 +47,7 @@ class MLPParameters:
     gradient_clip_norm: float | None = None
     resample_each_epoch: bool = True
     seed: int = 0
-    log_every: int = 10
+    log_every: int = 20
     inference_batch_size: int = 1024
 
 

@@ -1,0 +1,50 @@
+# Every value omitted here is inherited from experiment_parameters.py.
+# Top-level overrides are shared by every session and may include physical or
+# model-construction parameters.
+[mlp]
+device = "cuda"
+dtype = "float64"
+
+# Session overrides are intentionally limited to training/optimizer settings.
+# The trained weights remain in memory and carry into the next session.
+[[sessions]]
+name = "adam_0"
+
+[sessions.mlp]
+optimizer = "adam"
+epochs = 4000
+learning_rate = 1e-3
+collocation_points = 512
+batch_size = 64
+
+[[sessions]]
+name = "adam_1"
+
+[sessions.mlp]
+optimizer = "adam"
+epochs = 2000
+learning_rate = 3e-4
+collocation_points = 512
+batch_size = 64
+
+[[sessions]]
+name = "adam_2"
+
+[sessions.mlp]
+optimizer = "adam"
+epochs = 2000
+learning_rate = 1e-4
+collocation_points = 512
+batch_size = 64
+
+[[sessions]]
+name = "lbfgs_refinement"
+
+[sessions.mlp]
+optimizer = "lbfgs"
+epochs = 25
+collocation_points = 1024
+lbfgs_learning_rate = 1.0
+lbfgs_max_iter = 50
+lbfgs_max_eval = 100
+log_every = 10
