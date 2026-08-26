@@ -17,7 +17,7 @@ class PseudomodeParameters:
     cavity_dimension: int = 20
     heom_depth: int = 5
     qutip_depths: tuple[int, ...] = (5,)
-    t_start: float = 0.0
+    t_start: float = 0
     t_stop: float = 10
     n_times: int = 1_000
     rtol: float = 1e-8
@@ -26,12 +26,16 @@ class PseudomodeParameters:
 
 @dataclass(frozen=True)
 class MLPParameters:
-    hidden_sizes: tuple[int, ...] = (64, 64, 64, 64)
+    hidden_sizes: tuple[int, ...] = (64, 64, 64)
     activation: str = "tanh"
     dtype: str = "float64"
     device: str = "cuda"
-    epochs: int = 200
-    collocation_points: int = 512
+    tier_normalized_loss: bool = True
+    #time_switch: str = "exponential"
+    time_switch: str = "linear"
+    switch_time_constant: float = 1.0
+    epochs: int = 300
+    collocation_points: int = 1024
     batch_size: int = 64
     #optimizer: str = "adam"
     optimizer: str = "lbfgs"
@@ -47,7 +51,7 @@ class MLPParameters:
     gradient_clip_norm: float | None = None
     resample_each_epoch: bool = True
     seed: int = 0
-    log_every: int = 20
+    log_every: int = 100
     inference_batch_size: int = 1024
 
 

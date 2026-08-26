@@ -50,10 +50,13 @@ class HEOMPINNLoss(nn.Module):
         hierarchy: heom_state,
         *,
         liouvillian=None,
+        tier_normalized: bool = False,
         dtype: torch.dtype = torch.float64,
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
+        if not isinstance(tier_normalized, bool):
+            raise TypeError("tier_normalized must be a boolean")
         if liouvillian is None:
             liouvillian = hierarchy.build_Liouvillian(
                 markovian_terminator=False,
@@ -61,6 +64,32 @@ class HEOMPINNLoss(nn.Module):
             )
 
         self.state_size = hierarchy.nADO * hierarchy.system_size
+        self.tier_normalized = tier_normalized
+
+        residual_weights = np.ones(2 * self.state_size, dtype=np.float64)
+        if tier_normalized:
+            ado_tiers = np.asarray(
+                [hierarchy._tier(node) for node in hierarchy.idx_to_node],
+                dtype=np.int64,
+            )
+            max_tier = int(ado_tiers.max(initial=0))
+            tier_counts = np.bincount(ado_tiers, minlength=max_tier + 1)
+            # The original loss divides by nADO.  Multiplying every ADO in
+            # tier l by nADO / ((L + 1) * N_l) cancels that global nADO and
+            # produces an equal average over tiers:
+            #   1/(L+1) sum_l 1/(B*d^2*N_l) sum_(q,j in l) |R_qj|^2.
+            ado_weights = hierarchy.nADO / (
+                (max_tier + 1) * tier_counts[ado_tiers]
+            )
+            complex_weights = np.repeat(ado_weights, hierarchy.system_size)
+            residual_weights = np.concatenate(
+                (complex_weights, complex_weights)
+            )
+        self.register_buffer(
+            "residual_weights",
+            torch.as_tensor(residual_weights, dtype=dtype, device=device),
+            persistent=False,
+        )
 
         real_liouvillian = q_func.sup_op_to_real(liouvillian).tocsr()
         self.register_buffer(
@@ -84,9 +113,13 @@ class HEOMPINNLoss(nn.Module):
         time_derivative: torch.Tensor,
     ) -> torch.Tensor:
         residual = time_derivative - self.rhs(state)
-        return residual.square().sum() / (
-            self.state_size * state.shape[0]
-        )
+        squared_residual = residual.square()
+        if self.tier_normalized:
+            # The weights are a precomputed contiguous vector and broadcast
+            # over the batch.  Applying them in place avoids allocating a
+            # second full residual tensor inside every optimizer closure.
+            squared_residual.mul_(self.residual_weights)
+        return squared_residual.sum() / (self.state_size * state.shape[0])
 
     def forward(
         self,
@@ -193,12 +226,13 @@ def train_mlp(
             dtype=model.dtype,
             device=model.device,
         )
-        # HEOMPINNLoss reports a mean residual so results remain comparable
-        # across hierarchy and collocation-grid sizes.  PyTorch L-BFGS uses an
-        # absolute y^T s > 1e-10 safeguard for accepting curvature pairs; the
-        # tiny mean-loss scale can therefore leave its history permanently
-        # empty.  Optimize the equivalent residual sum while retaining the
-        # normalized mean for reporting and convergence diagnostics.
+        # HEOMPINNLoss reports a normalized residual so results remain
+        # comparable across hierarchy and collocation-grid sizes.  PyTorch
+        # L-BFGS uses an absolute y^T s > 1e-10 safeguard for accepting
+        # curvature pairs; the tiny reported scale can therefore leave its
+        # history permanently empty.  Apply one fixed equivalent scaling for
+        # optimization while retaining the normalized loss for reporting.
+        # The same scale is suitable for both global and tier-normalized loss.
         lbfgs_loss_scale = objective.state_size * fixed_times.numel()
     elif not config.resample_each_epoch:
         fixed_times = _collocation_times(

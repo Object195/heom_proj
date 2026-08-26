@@ -107,6 +107,45 @@ session is rejected because it would make in-memory weight reuse ambiguous.
 Because every stage shares one network dtype, a sequence containing L-BFGS
 must use top-level `dtype = "float64"` (the default).
 
+Set `tier_normalized_loss = true` in the top-level `[mlp]` table to give each
+hierarchy tier equal weight. The loss averages each tier over its own ADO count
+and then averages the tier losses with the global factor `1 / (L + 1)`. The
+default is `false`, which preserves the original global ADO-normalized loss.
+This is a base-only setting because the objective is shared across all sessions.
+
+The model uses `time_switch = "linear"` by default, preserving the constrained
+output `rho(t) = rho(t_start) + ((t - t_start) / T) correction(t)`. For a
+bounded switch during time extrapolation, set these top-level `[mlp]` options:
+
+```toml
+time_switch = "exponential"
+switch_time_constant = 1.0
+```
+
+Here `switch_time_constant` is in physical time units. Internally it is divided
+by `T = t_stop - t_start` and the switch is evaluated as
+`(1 - exp(-(t-t_start)/t_c)) / (1 - exp(-T/t_c))`. It is therefore zero at
+`t_start`, one at `t_stop`, and bounded for later times. The physical-time JVP
+used by the residual differentiates the complete model, so it automatically
+includes the exponential-switch derivative.
+
+To train from a later point on the physical trajectory, set the top-level
+`[pseudomode]` interval accordingly:
+
+```toml
+[pseudomode]
+t_start = 5.0
+t_stop = 10.0
+```
+
+When `t_start > 0`, the factorized state at physical time zero is first evolved
+to `t_start` with the same normalized, hard-cutoff sparse HEOM used by the
+training residual. The entire evolved hierarchy—including all nonzero ADOs—is
+then used as the MLP's constrained initial state. Time is not reset: the MLP
+still receives physical `t`, while its existing normalization maps
+`[t_start, t_stop]` to `[-1, 1]`. Consequently, the physical-time JVP and HEOM
+residual require no special adjustment.
+
 A TOML file with only top-level overrides runs one session. `--config` is an
 alias for `--sequence`, and `--resume` loads the checkpoint once before the
 first session. The legacy `--optimizer` option remains available for a

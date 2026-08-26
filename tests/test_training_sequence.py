@@ -62,6 +62,9 @@ g = 0.25
 [mlp]
 device = "cpu"
 epochs = 7
+tier_normalized_loss = true
+time_switch = "exponential"
+switch_time_constant = 0.75
 
 [[sessions]]
 name = "warmup"
@@ -76,7 +79,14 @@ epochs = 2
 """
         )
 
-        expected_base = replace(MLP, device="cpu", epochs=7)
+        expected_base = replace(
+            MLP,
+            device="cpu",
+            epochs=7,
+            tier_normalized_loss=True,
+            time_switch="exponential",
+            switch_time_constant=0.75,
+        )
         self.assertEqual(sequence.pseudomode, replace(PSEUDOMODE, g=0.25))
         self.assertEqual(sequence.base_mlp, expected_base)
         self.assertEqual(
@@ -183,8 +193,16 @@ epochs = 3
             "unknown pseudomode field": "[pseudomode]\ngamam = 1.0\n",
             "unknown mlp field": "[mlp]\nepohs = 2\n",
             "invalid optimizer": "[mlp]\noptimizer = 'sgd'\n",
+            "invalid tier loss flag": (
+                "[mlp]\ntier_normalized_loss = 'yes'\n"
+            ),
+            "invalid time switch": "[mlp]\ntime_switch = 'quadratic'\n",
+            "invalid switch time constant": (
+                "[mlp]\nswitch_time_constant = 0.0\n"
+            ),
             "invalid numeric value": "[mlp]\nepochs = 0\n",
             "invalid value type": "[mlp]\nepochs = 'two'\n",
+            "negative training start": "[pseudomode]\nt_start = -1.0\n",
             "missing session name": """
 [[sessions]]
 [sessions.mlp]
@@ -209,6 +227,18 @@ name = "repeat"
 name = "resize"
 [sessions.mlp]
 hidden_sizes = [4]
+""",
+            "session loss change": """
+[[sessions]]
+name = "different-loss"
+[sessions.mlp]
+tier_normalized_loss = true
+""",
+            "session time switch change": """
+[[sessions]]
+name = "different-switch"
+[sessions.mlp]
+time_switch = "exponential"
 """,
             "session pseudomode change": """
 [[sessions]]
@@ -278,12 +308,63 @@ class TrainingMetadataTests(unittest.TestCase):
             self.assertTrue(metadata_path.is_file())
             self.assertEqual(load_training_metadata(model_path), sequence)
             document = json.loads(metadata_path.read_text(encoding="utf-8"))
-            self.assertEqual(document["format_version"], 1)
+            self.assertEqual(document["format_version"], 3)
             self.assertIsInstance(document["base_mlp"]["hidden_sizes"], list)
             self.assertIsInstance(
                 document["pseudomode"]["qutip_depths"],
                 list,
             )
+
+    def test_version_one_metadata_defaults_to_global_loss(self):
+        sequence = self.make_sequence()
+        with TemporaryDirectory() as directory:
+            model_path = Path(directory) / "model.pt"
+            metadata_path = save_training_metadata(sequence, model_path)
+            document = json.loads(metadata_path.read_text(encoding="utf-8"))
+            document["format_version"] = 1
+            document["base_mlp"].pop("tier_normalized_loss")
+            document["base_mlp"].pop("time_switch")
+            document["base_mlp"].pop("switch_time_constant")
+            for session in document["sessions"]:
+                session["mlp"].pop("tier_normalized_loss")
+                session["mlp"].pop("time_switch")
+                session["mlp"].pop("switch_time_constant")
+            metadata_path.write_text(json.dumps(document), encoding="utf-8")
+
+            loaded = load_training_metadata(model_path)
+
+        self.assertFalse(loaded.base_mlp.tier_normalized_loss)
+        self.assertEqual(loaded.base_mlp.time_switch, "linear")
+        self.assertEqual(loaded.base_mlp.switch_time_constant, 1.0)
+        self.assertTrue(
+            all(
+                not session.mlp.tier_normalized_loss
+                for session in loaded.sessions
+            )
+        )
+
+    def test_version_two_metadata_defaults_to_linear_switch(self):
+        sequence = self.make_sequence()
+        with TemporaryDirectory() as directory:
+            model_path = Path(directory) / "model.pt"
+            metadata_path = save_training_metadata(sequence, model_path)
+            document = json.loads(metadata_path.read_text(encoding="utf-8"))
+            document["format_version"] = 2
+            document["base_mlp"].pop("time_switch")
+            document["base_mlp"].pop("switch_time_constant")
+            for session in document["sessions"]:
+                session["mlp"].pop("time_switch")
+                session["mlp"].pop("switch_time_constant")
+            metadata_path.write_text(json.dumps(document), encoding="utf-8")
+
+            loaded = load_training_metadata(model_path)
+
+        self.assertEqual(loaded.base_mlp.time_switch, "linear")
+        self.assertEqual(loaded.base_mlp.switch_time_constant, 1.0)
+        self.assertEqual(
+            loaded.base_mlp.tier_normalized_loss,
+            sequence.base_mlp.tier_normalized_loss,
+        )
 
     def test_metadata_save_failure_preserves_previous_sidecar(self):
         sequence = self.make_sequence()
@@ -330,7 +411,7 @@ class TrainingMetadataTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid.*JSON"):
                 load_training_metadata(model_path)
 
-            unsupported = dict(valid, format_version=2)
+            unsupported = dict(valid, format_version=4)
             metadata_path.write_text(
                 json.dumps(unsupported),
                 encoding="utf-8",
@@ -464,7 +545,7 @@ class TrainingSequenceEntrypointTests(unittest.TestCase):
             sessions=(warmup, polish),
         )
         hierarchy = object()
-        rho0 = object()
+        initial_heom_state = object()
         liouvillian = object()
         model = Mock(name="model")
         model.state_dict.return_value = {"weight": "state"}
@@ -485,7 +566,11 @@ class TrainingSequenceEntrypointTests(unittest.TestCase):
             with (
                 patch(
                     "model.train_mlp_model.build_training_problem",
-                    return_value=(hierarchy, rho0, liouvillian),
+                    return_value=(
+                        hierarchy,
+                        initial_heom_state,
+                        liouvillian,
+                    ),
                 ) as build_problem,
                 patch(
                     "model.train_mlp_model.HEOMMLP",
@@ -525,16 +610,19 @@ class TrainingSequenceEntrypointTests(unittest.TestCase):
         model_type.assert_called_once_with(
             hierarchy,
             hidden_sizes=base_mlp.hidden_sizes,
-            rho0=rho0,
+            initial_heom_state=initial_heom_state,
             t_start=sequence.pseudomode.t_start,
             t_stop=sequence.pseudomode.t_stop,
             activation=base_mlp.activation,
+            time_switch=base_mlp.time_switch,
+            switch_time_constant=base_mlp.switch_time_constant,
             dtype=torch.float64,
             device=torch.device("cpu"),
         )
         objective_type.assert_called_once_with(
             hierarchy,
             liouvillian=liouvillian,
+            tier_normalized=base_mlp.tier_normalized_loss,
             dtype=torch.float64,
             device=torch.device("cpu"),
         )

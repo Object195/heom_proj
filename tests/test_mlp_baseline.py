@@ -10,6 +10,7 @@ import torch
 from experiment_parameters import MLP
 from heom import q_func
 from heom.heom_rep import heom_state
+from heom.heom_solver import prepare_heom_initial_state, solve_heom
 from model import (
     EpochRecord,
     HEOMMLP,
@@ -125,6 +126,151 @@ def test_physical_time_derivative_includes_normalization_chain_rule():
     )
     torch.testing.assert_close(short_state, long_state)
     torch.testing.assert_close(short_derivative, 5.0 * long_derivative)
+
+
+def test_exponential_switch_endpoints_extrapolation_and_time_derivative():
+    hierarchy = make_hierarchy(depth=1)
+    t_start = 2.0
+    t_stop = 6.0
+    time_constant = 0.75
+    model = HEOMMLP(
+        hierarchy,
+        hidden_sizes=(5,),
+        rho0=make_rho0(),
+        t_start=t_start,
+        t_stop=t_stop,
+        time_switch="exponential",
+        switch_time_constant=time_constant,
+    )
+
+    endpoint_times = torch.tensor([t_start, t_stop], dtype=torch.float64)
+    torch.testing.assert_close(
+        model.switching_function(endpoint_times),
+        torch.tensor([0.0, 1.0], dtype=torch.float64),
+        rtol=1e-14,
+        atol=1e-14,
+    )
+    late_switch = model.switching_function(
+        torch.tensor([100.0], dtype=torch.float64)
+    )
+    asymptote = 1.0 / (-np.expm1(-(t_stop - t_start) / time_constant))
+    torch.testing.assert_close(
+        late_switch,
+        torch.tensor([asymptote], dtype=torch.float64),
+        rtol=1e-14,
+        atol=1e-14,
+    )
+
+    initial_time = torch.tensor([t_start], dtype=torch.float64)
+    _, initial_derivative = state_and_time_derivative(model, initial_time)
+    denominator = -np.expm1(-(t_stop - t_start) / time_constant)
+    expected_initial_derivative = model.state_correction(initial_time) / (
+        time_constant * denominator
+    )
+    torch.testing.assert_close(
+        initial_derivative,
+        expected_initial_derivative,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+    interior_time = torch.tensor([3.25], dtype=torch.float64)
+    _, derivative = state_and_time_derivative(
+        model,
+        interior_time,
+        create_graph=False,
+    )
+    step = 1e-6
+    finite_difference = (
+        model(interior_time + step) - model(interior_time - step)
+    ) / (2.0 * step)
+    torch.testing.assert_close(
+        derivative,
+        finite_difference,
+        rtol=1e-7,
+        atol=1e-8,
+    )
+
+
+def test_time_switch_validation_rejects_invalid_configuration():
+    hierarchy = make_hierarchy(depth=1)
+    common = {
+        "hidden_sizes": (5,),
+        "rho0": make_rho0(),
+        "t_start": 0.0,
+        "t_stop": 1.0,
+    }
+    with np.testing.assert_raises_regex(ValueError, "time_switch"):
+        HEOMMLP(hierarchy, time_switch="quadratic", **common)
+    with np.testing.assert_raises_regex(ValueError, "time_constant"):
+        HEOMMLP(
+            hierarchy,
+            time_switch="exponential",
+            switch_time_constant=0.0,
+            **common,
+        )
+
+
+def test_later_start_uses_complete_sparse_evolved_heom_state():
+    hierarchy = make_hierarchy(depth=1)
+    rho0 = make_rho0()
+    liouvillian = hierarchy.build_Liouvillian(normalized=True)
+    t_start = 0.2
+    prepared = prepare_heom_initial_state(
+        hierarchy,
+        rho0,
+        t_start,
+        liouvillian=liouvillian,
+        rtol=1e-10,
+        atol=1e-12,
+    )
+    direct = solve_heom(
+        hierarchy,
+        rho0,
+        np.array([0.0, t_start]),
+        liouvillian=liouvillian,
+        rtol=1e-10,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(prepared, direct.y[:, -1], atol=1e-13)
+    assert np.linalg.norm(prepared[hierarchy.system_size :]) > 0.0
+
+    model = HEOMMLP(
+        hierarchy,
+        hidden_sizes=(5,),
+        initial_heom_state=prepared,
+        t_start=t_start,
+        t_stop=1.0,
+    )
+    model_at_start = model(torch.tensor([t_start], dtype=torch.float64))[0]
+    torch.testing.assert_close(
+        model_at_start,
+        torch.as_tensor(q_func.state_to_real(prepared), dtype=torch.float64),
+    )
+
+    continued = solve_heom(
+        hierarchy,
+        None,
+        np.array([t_start, 0.3]),
+        initial_state=prepared,
+        liouvillian=liouvillian,
+        rtol=1e-10,
+        atol=1e-12,
+    )
+    uninterrupted = solve_heom(
+        hierarchy,
+        rho0,
+        np.array([0.0, 0.3]),
+        liouvillian=liouvillian,
+        rtol=1e-10,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        continued.y[:, -1],
+        uninterrupted.y[:, -1],
+        rtol=1e-9,
+        atol=1e-11,
+    )
 
 
 def test_column_major_vectorization_round_trip():
@@ -287,6 +433,54 @@ def test_jvp_and_loss_backpropagate_to_every_parameter():
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
         for parameter in model.parameters()
     )
+
+
+def test_tier_normalized_loss_matches_equal_tier_average():
+    hierarchy = make_hierarchy(depth=2)
+    liouvillian = hierarchy.build_Liouvillian(normalized=True)
+    objective = HEOMPINNLoss(
+        hierarchy,
+        liouvillian=liouvillian,
+        tier_normalized=True,
+    )
+    batch_size = 5
+    generator = torch.Generator().manual_seed(123)
+    state = torch.zeros(
+        batch_size,
+        2 * objective.state_size,
+        dtype=torch.float64,
+    )
+    derivative = torch.randn(
+        state.shape,
+        dtype=torch.float64,
+        generator=generator,
+    )
+
+    actual = objective.dynamics_loss(state, derivative)
+    residual_u, residual_v = derivative.split(objective.state_size, dim=-1)
+    energy = (
+        residual_u.reshape(batch_size, hierarchy.nADO, hierarchy.system_size)
+        .square()
+        + residual_v.reshape(
+            batch_size,
+            hierarchy.nADO,
+            hierarchy.system_size,
+        ).square()
+    )
+    tier_means = []
+    for tier in range(hierarchy.L + 1):
+        indices = torch.as_tensor(
+            [
+                index
+                for index, node in enumerate(hierarchy.idx_to_node)
+                if hierarchy._tier(node) == tier
+            ],
+            dtype=torch.long,
+        )
+        tier_means.append(energy.index_select(1, indices).mean())
+    expected = torch.stack(tier_means).mean()
+
+    torch.testing.assert_close(actual, expected)
 
 
 def test_partial_minibatches_match_the_full_objective():

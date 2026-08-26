@@ -4,6 +4,7 @@ import argparse
 import sys
 from dataclasses import replace
 from pathlib import Path
+from time import perf_counter
 from uuid import uuid4
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +22,7 @@ from experiment_parameters import (
     PseudomodeParameters,
 )
 from heom.heom_rep import heom_state
+from heom.heom_solver import prepare_heom_initial_state
 from model import (
     EpochRecord,
     HEOMMLP,
@@ -156,7 +158,23 @@ def build_training_problem(parameters: PseudomodeParameters = PSEUDOMODE):
         markovian_terminator=False,
         normalized=True,
     )
-    return hierarchy, rho0, liouvillian
+    preparation_start = perf_counter()
+    initial_heom_state = prepare_heom_initial_state(
+        hierarchy,
+        rho0,
+        parameters.t_start,
+        liouvillian=liouvillian,
+        method="BDF",
+        rtol=parameters.rtol,
+        atol=parameters.atol,
+    )
+    if parameters.t_start > 0.0:
+        print(
+            "Sparse HEOM initial-state preparation to "
+            f"t={parameters.t_start:g}: "
+            f"{perf_counter() - preparation_start:.3f} s"
+        )
+    return hierarchy, initial_heom_state, liouvillian
 
 
 class _OptimizerAction(argparse.Action):
@@ -247,7 +265,13 @@ _CHECKPOINT_PSEUDOMODE_FIELDS = (
     "t_start",
     "t_stop",
 )
-_CHECKPOINT_MLP_FIELDS = ("hidden_sizes", "activation", "dtype")
+_CHECKPOINT_MLP_FIELDS = (
+    "hidden_sizes",
+    "activation",
+    "dtype",
+    "time_switch",
+    "switch_time_constant",
+)
 
 
 def _checkpoint_config_differences(
@@ -306,15 +330,19 @@ def run_training_sequence(
             f"invalid MLP device {sequence.base_mlp.device!r}"
         ) from error
     torch.manual_seed(sequence.base_mlp.seed)
-    hierarchy, rho0, liouvillian = build_training_problem(pseudomode)
+    hierarchy, initial_heom_state, liouvillian = build_training_problem(
+        pseudomode
+    )
 
     model = HEOMMLP(
         hierarchy,
         hidden_sizes=sequence.base_mlp.hidden_sizes,
-        rho0=rho0,
+        initial_heom_state=initial_heom_state,
         t_start=pseudomode.t_start,
         t_stop=pseudomode.t_stop,
         activation=sequence.base_mlp.activation,
+        time_switch=sequence.base_mlp.time_switch,
+        switch_time_constant=sequence.base_mlp.switch_time_constant,
         dtype=dtype,
         device=device,
     )
@@ -324,6 +352,7 @@ def run_training_sequence(
     objective = HEOMPINNLoss(
         hierarchy,
         liouvillian=liouvillian,
+        tier_normalized=sequence.base_mlp.tier_normalized_loss,
         dtype=dtype,
         device=device,
     )
@@ -340,10 +369,18 @@ def run_training_sequence(
     for index, session in enumerate(sequence.sessions, start=1):
         parameters = session.mlp
         print(f"Session {index}/{session_count}: {session.name}")
+        print(
+            "Loss: "
+            + (
+                "equal-weight tier-normalized residual"
+                if sequence.base_mlp.tier_normalized_loss
+                else "global ADO-normalized residual"
+            )
+        )
         if parameters.optimizer == "lbfgs":
             print(
                 "Optimizer: L-BFGS (float64, fixed full batch, "
-                "strong-Wolfe line search, residual-sum scaling)"
+                "strong-Wolfe line search, fixed loss scaling)"
             )
         else:
             print("Optimizer: Adam")

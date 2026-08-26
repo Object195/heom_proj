@@ -235,6 +235,8 @@ def _validate_pseudomode(
         _integer(depth, f"{location}.qutip_depths[{index}]")
     if parameters.t_stop <= parameters.t_start:
         raise ValueError(f"{location}.t_stop must be greater than t_start")
+    if parameters.t_start < 0.0:
+        raise ValueError(f"{location}.t_start must be non-negative")
     _integer(parameters.n_times, f"{location}.n_times", minimum=2)
     _positive_number(parameters.rtol, f"{location}.rtol")
     _positive_number(parameters.atol, f"{location}.atol")
@@ -265,6 +267,21 @@ def _validate_mlp(parameters: MLPParameters, location: str) -> None:
         raise ValueError(f"{location}.dtype must be float32 or float64")
     if not isinstance(parameters.device, str) or not parameters.device.strip():
         raise ValueError(f"{location}.device must be a non-empty string")
+    if not isinstance(parameters.tier_normalized_loss, bool):
+        raise ValueError(
+            f"{location}.tier_normalized_loss must be a boolean"
+        )
+    if (
+        not isinstance(parameters.time_switch, str)
+        or parameters.time_switch not in {"linear", "exponential"}
+    ):
+        raise ValueError(
+            f"{location}.time_switch must be linear or exponential"
+        )
+    _positive_number(
+        parameters.switch_time_constant,
+        f"{location}.switch_time_constant",
+    )
     if not isinstance(parameters.optimizer, str) or parameters.optimizer not in {
         "adam",
         "lbfgs",
@@ -432,7 +449,7 @@ def _metadata_document(sequence: TrainingSequence) -> dict[str, object]:
         raise TypeError("sequence must be a TrainingSequence object")
     sequence.__post_init__()
     return {
-        "format_version": 1,
+        "format_version": 3,
         "pseudomode": asdict(sequence.pseudomode),
         "base_mlp": asdict(sequence.base_mlp),
         "sessions": [
@@ -499,11 +516,11 @@ def load_training_metadata(model_path: str | Path) -> TrainingSequence:
     if (
         isinstance(format_version, bool)
         or not isinstance(format_version, int)
-        or format_version != 1
+        or format_version not in {1, 2, 3}
     ):
         raise ValueError(
             "unsupported training metadata format_version "
-            f"{format_version!r}; expected 1"
+            f"{format_version!r}; expected 1, 2, or 3"
         )
 
     pseudomode_values = _json_object(
@@ -523,10 +540,17 @@ def load_training_metadata(model_path: str | Path) -> TrainingSequence:
     )
     assert isinstance(pseudomode, PseudomodeParameters)
 
-    base_mlp_values = _json_object(
-        metadata["base_mlp"],
-        "training metadata.base_mlp",
+    base_mlp_values = dict(
+        _json_object(
+            metadata["base_mlp"],
+            "training metadata.base_mlp",
+        )
     )
+    if format_version == 1:
+        base_mlp_values.setdefault("tier_normalized_loss", False)
+    if format_version < 3:
+        base_mlp_values.setdefault("time_switch", "linear")
+        base_mlp_values.setdefault("switch_time_constant", 1.0)
     _exact_keys(
         base_mlp_values,
         _MLP_FIELDS,
@@ -560,10 +584,26 @@ def load_training_metadata(model_path: str | Path) -> TrainingSequence:
             raise ValueError(f"duplicate training session name: {name!r}")
         names.add(name)
 
-        session_mlp_values = _json_object(
-            session_values["mlp"],
-            f"{location}.mlp",
+        session_mlp_values = dict(
+            _json_object(
+                session_values["mlp"],
+                f"{location}.mlp",
+            )
         )
+        if format_version == 1:
+            session_mlp_values.setdefault(
+                "tier_normalized_loss",
+                base_mlp.tier_normalized_loss,
+            )
+        if format_version < 3:
+            session_mlp_values.setdefault(
+                "time_switch",
+                base_mlp.time_switch,
+            )
+            session_mlp_values.setdefault(
+                "switch_time_constant",
+                base_mlp.switch_time_constant,
+            )
         _exact_keys(session_mlp_values, _MLP_FIELDS, f"{location}.mlp")
         session_mlp = _resolve_parameters(
             base_mlp,

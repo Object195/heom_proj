@@ -11,6 +11,7 @@ Then run this benchmark with::
 
 import argparse
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 
@@ -25,14 +26,23 @@ from qutip import basis, destroy, mesolve, qeye, sigmax, sigmaz, tensor
 
 from experiment_parameters import MLP, MLP_MODEL_PATH, PSEUDOMODE
 from heom.heom_rep import heom_state
-from heom.heom_solver import solve_heom
-from model import HEOMMLP, solve_mlp
+from heom.heom_solver import prepare_heom_initial_state, solve_heom
+from model import (
+    HEOMMLP,
+    HEOMPINNLoss,
+    solve_mlp,
+    state_and_time_derivative,
+)
 from training_sequence import (
     default_training_sequence,
     load_training_metadata,
     load_training_sequence,
     training_metadata_path,
 )
+
+
+_LINDBLADIAN_MAX_OUTPUT_STEP = 1.0
+_LINDBLADIAN_MAX_INTERNAL_STEPS = 100_000
 
 
 def build_benchmark_time_grids(
@@ -86,8 +96,177 @@ def build_benchmark_time_grids(
     return t_eval, reference_t_eval, 1
 
 
+@dataclass(frozen=True)
+class TierResidualStatistics:
+    """Time-aggregated dynamical residual statistics for one HEOM tier."""
+
+    tier: int
+    n_ados: int
+    mean_squared_residual: float
+    max_time_squared_residual: float
+    max_component_residual: float
+
+
+def compute_tier_residual_statistics(
+    model,
+    hierarchy,
+    liouvillian,
+    t_eval,
+    *,
+    batch_size=1_024,
+):
+    r"""Evaluate ``R = d chi / dt - L chi`` and aggregate it by ADO tier.
+
+    For a two-level system, the reported mean is exactly
+
+    ``E_l = sum_(q,j in l) (||R_U,qj||^2 + ||R_V,qj||^2)/(4 B N_l)``.
+
+    ``max_time_squared_residual`` applies the same ``1/(4 N_l)`` tier
+    normalization at each time and takes the maximum over time.
+    ``max_component_residual`` is the largest complex-component magnitude
+    ``sqrt(R_U^2 + R_V^2)`` in the tier.
+    """
+    t_eval = np.asarray(t_eval, dtype=np.float64).reshape(-1)
+    if t_eval.size == 0:
+        raise ValueError("t_eval must contain at least one time")
+    if isinstance(batch_size, bool) or not isinstance(
+        batch_size, (int, np.integer)
+    ) or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+
+    tier_to_ados = {}
+    for ado_index, node in enumerate(hierarchy.idx_to_node):
+        tier = hierarchy._tier(node)
+        tier_to_ados.setdefault(tier, []).append(ado_index)
+    tier_indices = {
+        tier: torch.as_tensor(indices, dtype=torch.long, device=model.device)
+        for tier, indices in tier_to_ados.items()
+    }
+    tier_sums = {tier: 0.0 for tier in tier_to_ados}
+    tier_max_times = {tier: 0.0 for tier in tier_to_ados}
+    tier_max_components = {tier: 0.0 for tier in tier_to_ados}
+
+    objective = HEOMPINNLoss(
+        hierarchy,
+        liouvillian=liouvillian,
+        dtype=model.dtype,
+        device=model.device,
+    )
+    was_training = model.training
+    model.eval()
+    start = perf_counter()
+    try:
+        with torch.enable_grad():
+            for first in range(0, t_eval.size, int(batch_size)):
+                times = model.prepare_times(t_eval[first : first + batch_size])
+                state, time_derivative = state_and_time_derivative(
+                    model,
+                    times,
+                    create_graph=False,
+                )
+                residual = time_derivative - objective.rhs(state)
+                residual_u, residual_v = residual.split(
+                    model.state_size,
+                    dim=-1,
+                )
+                component_energy = (
+                    residual_u.reshape(
+                        -1,
+                        model.n_ados,
+                        model.system_size,
+                    ).square()
+                    + residual_v.reshape(
+                        -1,
+                        model.n_ados,
+                        model.system_size,
+                    ).square()
+                )
+
+                for tier, indices in tier_indices.items():
+                    tier_energy = component_energy.index_select(1, indices)
+                    time_squared_residual = tier_energy.mean(dim=(1, 2))
+                    tier_sums[tier] += time_squared_residual.sum().item()
+                    tier_max_times[tier] = max(
+                        tier_max_times[tier],
+                        time_squared_residual.amax().item(),
+                    )
+                    tier_max_components[tier] = max(
+                        tier_max_components[tier],
+                        tier_energy.amax().sqrt().item(),
+                    )
+    finally:
+        model.train(was_training)
+    print(f"MLP residual evaluation: {perf_counter() - start:.3f} s")
+
+    return tuple(
+        TierResidualStatistics(
+            tier=tier,
+            n_ados=len(tier_to_ados[tier]),
+            mean_squared_residual=tier_sums[tier] / t_eval.size,
+            max_time_squared_residual=tier_max_times[tier],
+            max_component_residual=tier_max_components[tier],
+        )
+        for tier in sorted(tier_to_ados)
+    )
+
+
+def _build_lindbladian_solver_grid(
+    t_eval,
+    *,
+    max_output_step=_LINDBLADIAN_MAX_OUTPUT_STEP,
+):
+    """Add intermediate output times and return requested-sample indices.
+
+    QuTiP's SciPy integrator applies ``nsteps`` between consecutive entries in
+    its time list. A later-start calculation with only ``[0, t_start, ...]``
+    can therefore fail even though the physical problem is well behaved.
+    Splitting every large gap also makes sparse and dense benchmark grids
+    equally reliable.
+    """
+    t_eval = np.asarray(t_eval, dtype=np.float64)
+    if t_eval.ndim != 1 or t_eval.size < 2:
+        raise ValueError("Lindbladian t_eval must be a 1D array of length >= 2")
+    if not np.isfinite(t_eval).all():
+        raise ValueError("Lindbladian t_eval must contain only finite times")
+    if t_eval[0] < 0.0:
+        raise ValueError("Lindbladian t_eval cannot start before physical t=0")
+    if np.any(np.diff(t_eval) <= 0.0):
+        raise ValueError("Lindbladian t_eval must be strictly increasing")
+    if not np.isfinite(max_output_step) or max_output_step <= 0.0:
+        raise ValueError("max_output_step must be finite and positive")
+
+    solver_times = [0.0]
+    requested_indices = []
+    for requested_time in t_eval:
+        interval_start = solver_times[-1]
+        if requested_time > interval_start:
+            interval_count = max(
+                1,
+                int(np.ceil((requested_time - interval_start) / max_output_step)),
+            )
+            solver_times.extend(
+                np.linspace(
+                    interval_start,
+                    requested_time,
+                    interval_count + 1,
+                )[1:]
+            )
+        requested_indices.append(len(solver_times) - 1)
+    return (
+        np.asarray(solver_times, dtype=np.float64),
+        np.asarray(requested_indices, dtype=np.int64),
+    )
+
+
 def run_lindbladian(t_eval, parameters=PSEUDOMODE):
     """Propagate the explicit damped-cavity Lindblad reference."""
+    solver_t_eval, requested_indices = _build_lindbladian_solver_grid(t_eval)
+    if solver_t_eval.size > requested_indices.size:
+        print(
+            "Lindbladian integration grid: "
+            f"{solver_t_eval.size} points for {requested_indices.size} "
+            "requested samples"
+        )
     annihilation = tensor(qeye(2), destroy(parameters.cavity_dimension))
     sz_full = tensor(sigmaz(), qeye(parameters.cavity_dimension))
     sx_full = tensor(sigmax(), qeye(parameters.cavity_dimension))
@@ -108,12 +287,19 @@ def run_lindbladian(t_eval, parameters=PSEUDOMODE):
     result = mesolve(
         h_total,
         psi0,
-        t_eval,
+        solver_t_eval,
         c_ops=collapse_operators,
         e_ops={"sz": sz_full},
+        options={
+            "method": "bdf",
+            "nsteps": _LINDBLADIAN_MAX_INTERNAL_STEPS,
+            "rtol": parameters.rtol,
+            "atol": parameters.atol,
+        },
     )
     print(f"Lindbladian propagation: {perf_counter() - start:.3f} s")
-    return np.asarray(result.e_data["sz"]).real
+    expectation = np.asarray(result.e_data["sz"]).real
+    return expectation[requested_indices]
 
 
 def build_normalized_hard_heom(parameters=PSEUDOMODE):
@@ -145,12 +331,27 @@ def build_normalized_hard_heom(parameters=PSEUDOMODE):
         f"(L={parameters.heom_depth}, ADOs={hierarchy.nADO}, "
         f"shape={liouvillian.shape}): {perf_counter() - start:.3f} s"
     )
-    return hierarchy, rho0, liouvillian
+    start = perf_counter()
+    initial_heom_state = prepare_heom_initial_state(
+        hierarchy,
+        rho0,
+        parameters.t_start,
+        liouvillian=liouvillian,
+        method="BDF",
+        rtol=parameters.rtol,
+        atol=parameters.atol,
+    )
+    if parameters.t_start > 0.0:
+        print(
+            "Sparse HEOM initial-state preparation to "
+            f"t={parameters.t_start:g}: {perf_counter() - start:.3f} s"
+        )
+    return hierarchy, initial_heom_state, liouvillian
 
 
 def run_sparse_numerics(
     hierarchy,
-    rho0,
+    initial_heom_state,
     liouvillian,
     t_eval,
     parameters=PSEUDOMODE,
@@ -158,8 +359,9 @@ def run_sparse_numerics(
     start = perf_counter()
     result = solve_heom(
         hierarchy,
-        rho0,
+        None,
         t_eval,
+        initial_state=initial_heom_state,
         liouvillian=liouvillian,
         method="BDF",
         rtol=parameters.rtol,
@@ -174,7 +376,7 @@ def run_sparse_numerics(
 
 def load_mlp(
     hierarchy,
-    rho0,
+    initial_heom_state,
     *,
     mlp_parameters=MLP,
     pseudomode_parameters=PSEUDOMODE,
@@ -185,10 +387,12 @@ def load_mlp(
     model = HEOMMLP(
         hierarchy,
         hidden_sizes=mlp_parameters.hidden_sizes,
-        rho0=rho0,
+        initial_heom_state=initial_heom_state,
         t_start=pseudomode_parameters.t_start,
         t_stop=pseudomode_parameters.t_stop,
         activation=mlp_parameters.activation,
+        time_switch=mlp_parameters.time_switch,
+        switch_time_constant=mlp_parameters.switch_time_constant,
         dtype=getattr(torch, mlp_parameters.dtype),
         device=device,
     )
@@ -340,24 +544,34 @@ def main(argv=None):
     lindbladian = run_lindbladian(reference_t_eval, pseudomode)[
         reference_offset:
     ]
-    hierarchy, rho0, liouvillian = build_normalized_hard_heom(pseudomode)
+    hierarchy, initial_heom_state, liouvillian = (
+        build_normalized_hard_heom(pseudomode)
+    )
     sparse_heom = run_sparse_numerics(
         hierarchy,
-        rho0,
+        initial_heom_state,
         liouvillian,
         reference_t_eval,
         pseudomode,
     )[reference_offset:]
+    model = load_mlp(
+        hierarchy,
+        initial_heom_state,
+        mlp_parameters=mlp_parameters,
+        pseudomode_parameters=pseudomode,
+        model_path=args.model_path,
+    )
     mlp = run_mlp_solver(
-        load_mlp(
-            hierarchy,
-            rho0,
-            mlp_parameters=mlp_parameters,
-            pseudomode_parameters=pseudomode,
-            model_path=args.model_path,
-        ),
+        model,
         t_eval,
         mlp_parameters,
+    )
+    tier_residuals = compute_tier_residual_statistics(
+        model,
+        hierarchy,
+        liouvillian,
+        t_eval,
+        batch_size=mlp_parameters.inference_batch_size,
     )
 
     print(
@@ -377,6 +591,14 @@ def main(argv=None):
         print(
             "Max |MLP - sparse HEOM| beyond training horizon: "
             f"{np.max(mlp_error[extrapolation_mask]):.3e}"
+        )
+    print("Tier-resolved MLP dynamical residuals:")
+    for statistics in tier_residuals:
+        print(
+            f"  tier {statistics.tier} (N={statistics.n_ados}): "
+            f"E_res_mean={statistics.mean_squared_residual:.6e}  "
+            f"E_res_max_t={statistics.max_time_squared_residual:.6e}  "
+            f"max|R|={statistics.max_component_residual:.6e}"
         )
     plot_trajectories(
         t_eval,

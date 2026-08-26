@@ -192,6 +192,7 @@ def solve_heom(
     rho0,
     t_eval,
     *,
+    initial_state=None,
     liouvillian=None,
     method="BDF",
     rtol=1e-8,
@@ -203,7 +204,9 @@ def solve_heom(
     The HEOM Liouvillian is supplied as the exact constant sparse Jacobian,
     avoiding a finite-difference Jacobian calculation. A prebuilt
     ``liouvillian`` may be passed when construction and propagation are timed
-    separately.
+    separately. By default, ``rho0`` is embedded as a product-state HEOM
+    vector. To continue from an already evolved hierarchy, pass ``rho0=None``
+    and supply the complete complex HEOM vector as ``initial_state``.
     """
     t_eval = np.asarray(t_eval, dtype=float)
     if liouvillian is None:
@@ -214,7 +217,23 @@ def solve_heom(
         def rhs(_time, state_vector):
             return liouvillian @ state_vector
 
-    initial_state = heom.build_initial_state(rho0, as_sparse=False)
+    if initial_state is None:
+        if rho0 is None:
+            raise ValueError("rho0 is required when initial_state is omitted")
+        initial_state = heom.build_initial_state(rho0, as_sparse=False)
+    else:
+        if rho0 is not None:
+            raise ValueError("pass either rho0 or initial_state, not both")
+        initial_state = np.asarray(initial_state, dtype=np.complex128)
+        expected_size = heom.nADO * heom.system_size
+        if initial_state.shape != (expected_size,):
+            raise ValueError(
+                "initial_state must be a flat full HEOM vector with shape "
+                f"({expected_size},)"
+            )
+        if not np.isfinite(initial_state).all():
+            raise ValueError("initial_state must contain only finite values")
+        initial_state = initial_state.copy()
 
     method_name = method.upper() if isinstance(method, str) else method
     if method_name in {"BDF", "RADAU"}:
@@ -245,10 +264,47 @@ def solve_heom(
     )
 
 
+def prepare_heom_initial_state(
+    heom,
+    rho0,
+    t_start,
+    *,
+    liouvillian=None,
+    method="BDF",
+    rtol=1e-8,
+    atol=1e-10,
+    **solver_options,
+):
+    """Return the complete HEOM state obtained at physical ``t_start``.
+
+    The factorized system state ``rho0`` is defined at physical time zero.
+    A zero start returns its ordinary embedded hierarchy directly; a positive
+    start propagates the same sparse HEOM used by the training residual.
+    """
+    t_start = float(t_start)
+    if not np.isfinite(t_start) or t_start < 0.0:
+        raise ValueError("t_start must be finite and non-negative")
+    if t_start == 0.0:
+        return heom.build_initial_state(rho0, as_sparse=False)
+
+    preparation = solve_heom(
+        heom,
+        rho0,
+        np.array([0.0, t_start]),
+        liouvillian=liouvillian,
+        method=method,
+        rtol=rtol,
+        atol=atol,
+        **solver_options,
+    )
+    return preparation.y[:, -1].copy()
+
+
 __all__ = [
     "HEOMSolution",
     "HEOMSpectrum",
     "build_heom_ode",
     "diagnose_heom_spectrum",
+    "prepare_heom_initial_state",
     "solve_heom",
 ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import math
 
 import numpy as np
 import torch
@@ -67,10 +68,13 @@ class HEOMMLP(nn.Module):
         hierarchy: heom_state,
         hidden_sizes: Sequence[int] = (64, 64, 64),
         *,
-        rho0,
+        rho0=None,
+        initial_heom_state=None,
         t_start: float,
         t_stop: float,
         activation: str = "tanh",
+        time_switch: str = "linear",
+        switch_time_constant: float = 1.0,
         dtype: torch.dtype = torch.float64,
         device: torch.device | str | None = None,
     ) -> None:
@@ -85,6 +89,26 @@ class HEOMMLP(nn.Module):
         self.input_size = 2 * (hierarchy.K + 1) + 1
         self.t_start = float(t_start)
         self.t_stop = float(t_stop)
+        self.time_span = self.t_stop - self.t_start
+        if not math.isfinite(self.time_span) or self.time_span <= 0.0:
+            raise ValueError("t_stop must be finite and greater than t_start")
+        if not isinstance(time_switch, str):
+            raise ValueError("time_switch must be 'linear' or 'exponential'")
+        self.time_switch = time_switch.lower()
+        if self.time_switch not in {"linear", "exponential"}:
+            raise ValueError("time_switch must be 'linear' or 'exponential'")
+        self.switch_time_constant = float(switch_time_constant)
+        if (
+            not math.isfinite(self.switch_time_constant)
+            or self.switch_time_constant <= 0.0
+        ):
+            raise ValueError("switch_time_constant must be finite and positive")
+        self.normalized_switch_time_constant = (
+            self.switch_time_constant / self.time_span
+        )
+        self._exponential_switch_denominator = -math.expm1(
+            -1.0 / self.normalized_switch_time_constant
+        )
 
         self.register_buffer(
             "ado_coordinates",
@@ -104,7 +128,29 @@ class HEOMMLP(nn.Module):
             ),
             persistent=False,
         )
-        initial_complex = hierarchy.build_initial_state(rho0, as_sparse=False)
+        if (rho0 is None) == (initial_heom_state is None):
+            raise ValueError(
+                "pass exactly one of rho0 or initial_heom_state"
+            )
+        if initial_heom_state is None:
+            initial_complex = hierarchy.build_initial_state(
+                rho0,
+                as_sparse=False,
+            )
+        else:
+            initial_complex = np.asarray(
+                initial_heom_state,
+                dtype=np.complex128,
+            )
+            if initial_complex.shape != (self.state_size,):
+                raise ValueError(
+                    "initial_heom_state must be a flat full HEOM vector "
+                    f"with shape ({self.state_size},)"
+                )
+            if not np.isfinite(initial_complex).all():
+                raise ValueError(
+                    "initial_heom_state must contain only finite values"
+                )
         self.register_buffer(
             "initial_state",
             torch.as_tensor(
@@ -171,9 +217,25 @@ class HEOMMLP(nn.Module):
     def normalize_times(self, times) -> torch.Tensor:
         """Map physical time from ``[t_start, t_stop]`` to ``[-1, 1]``."""
         times = self.prepare_times(times)
-        return 2.0 * (times - self.t_start) / (
-            self.t_stop - self.t_start
-        ) - 1.0
+        return 2.0 * (times - self.t_start) / self.time_span - 1.0
+
+    def switching_function(self, times) -> torch.Tensor:
+        """Return the initial-condition switch at physical ``times``.
+
+        The exponential switch is evaluated with normalized elapsed time
+        ``u = (t - t_start) / (t_stop - t_start)`` and
+        ``tau_c = switch_time_constant / (t_stop - t_start)``. Thus the
+        configured time constant remains in physical time units while the
+        numerical calculation uses the same time scale as the network input.
+        ``expm1`` preserves accuracy when the time constant is large.
+        """
+        elapsed_fraction = 0.5 * (self.normalize_times(times) + 1.0)
+        if self.time_switch == "linear":
+            return elapsed_fraction
+        numerator = -torch.expm1(
+            -elapsed_fraction / self.normalized_switch_time_constant
+        )
+        return numerator / self._exponential_switch_denominator
 
     def coordinate_inputs(self, times) -> torch.Tensor:
         """Build the ``(batch, nADO, 2*K+3)`` MLP input tensor."""
@@ -224,8 +286,7 @@ class HEOMMLP(nn.Module):
 
     def forward(self, times) -> torch.Tensor:
         times = self.prepare_times(times)
-        normalized_times = self.normalize_times(times)
-        switch = 0.5 * (normalized_times + 1.0)
+        switch = self.switching_function(times)
         return self.initial_state + switch[:, None] * self.state_correction(times)
 
     def complex_states(self, times) -> torch.Tensor:
@@ -254,8 +315,9 @@ def state_and_time_derivative(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Evaluate the state and its derivative with respect to physical time.
 
-    ``HEOMMLP.forward`` normalizes time internally. Differentiating the
-    composed model here includes the corresponding chain-rule factor.
+    ``HEOMMLP.forward`` normalizes time and applies its configured switch
+    internally. Differentiating the composed model here includes both
+    corresponding chain-rule factors.
     """
     times = model.prepare_times(times)
     return torch.autograd.functional.jvp(

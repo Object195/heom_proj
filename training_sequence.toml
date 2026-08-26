@@ -1,9 +1,23 @@
 # Every value omitted here is inherited from experiment_parameters.py.
 # Top-level overrides are shared by every session and may include physical or
 # model-construction parameters.
+# To train on a later physical interval, set t_start > 0. The complete HEOM
+# state is then prepared by sparse propagation from t=0 to t_start.
+# [pseudomode]
+#t_start = 0
+#t_stop = 10
+
 [mlp]
 device = "cuda"
 dtype = "float64"
+# Give every hierarchy tier equal weight, independent of its ADO count.
+tier_normalized_loss = true
+# The default linear switch is (t - t_start) / (t_stop - t_start).
+# To bound the switch during time extrapolation, use the exponential form and
+# set its time constant in the same physical units as t_start and t_stop:
+#time_switch = "exponential"
+time_switch = "linear"
+switch_time_constant = 1.0
 
 # Session overrides are intentionally limited to training/optimizer settings.
 # The trained weights remain in memory and carry into the next session.
@@ -12,10 +26,10 @@ name = "adam_0"
 
 [sessions.mlp]
 optimizer = "adam"
-epochs = 4000
+epochs = 2000
 learning_rate = 1e-3
 collocation_points = 512
-batch_size = 64
+batch_size = 256
 
 [[sessions]]
 name = "adam_1"
@@ -25,7 +39,7 @@ optimizer = "adam"
 epochs = 2000
 learning_rate = 3e-4
 collocation_points = 512
-batch_size = 64
+batch_size = 256
 
 [[sessions]]
 name = "adam_2"
@@ -35,16 +49,16 @@ optimizer = "adam"
 epochs = 2000
 learning_rate = 1e-4
 collocation_points = 512
-batch_size = 64
+batch_size = 256
 
 [[sessions]]
 name = "lbfgs_refinement"
 
 [sessions.mlp]
 optimizer = "lbfgs"
-epochs = 25
+epochs = 500
 collocation_points = 1024
 lbfgs_learning_rate = 1.0
 lbfgs_max_iter = 50
 lbfgs_max_eval = 100
-log_every = 10
+log_every = 20
