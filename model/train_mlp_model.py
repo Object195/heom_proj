@@ -1,8 +1,11 @@
 """Train, optionally resume, and save the Section-III MLP."""
 
 import argparse
+from collections.abc import Mapping
+from contextlib import redirect_stdout
 import sys
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 from uuid import uuid4
@@ -16,7 +19,6 @@ import torch
 
 from experiment_parameters import (
     MLP,
-    MLP_MODEL_PATH,
     PSEUDOMODE,
     MLPParameters,
     PseudomodeParameters,
@@ -28,6 +30,7 @@ from model import (
     HEOMMLP,
     HEOMPINNLoss,
     TrainingConfig,
+    compute_heom_dynamical_scales,
     train_mlp,
 )
 from training_sequence import (
@@ -35,7 +38,11 @@ from training_sequence import (
     default_training_sequence,
     load_training_metadata,
     load_training_sequence,
+    require_complete_training_checkpoint,
+    resolve_model_path,
+    resolve_pretrained_model_path,
     save_training_metadata,
+    training_incomplete_marker_path,
     training_metadata_path,
 )
 
@@ -95,6 +102,35 @@ def load_saved_model(model: HEOMMLP, path: Path, device: torch.device):
     state_dict = torch.load(path, map_location=device, weights_only=True)
     model.load_state_dict(state_dict)
     print(f"Resumed MLP model: {path}")
+
+
+def load_pretrained_network(
+    model: HEOMMLP,
+    path: Path,
+    device: torch.device,
+) -> None:
+    """Initialize only the shared MLP network from a saved checkpoint."""
+    require_complete_training_checkpoint(path)
+    state_dict = torch.load(path, map_location=device, weights_only=True)
+    if not isinstance(state_dict, Mapping):
+        raise ValueError(f"invalid pretrained model state dictionary: {path}")
+    prefix = "network."
+    network_state = {
+        name.removeprefix(prefix): value
+        for name, value in state_dict.items()
+        if isinstance(name, str) and name.startswith(prefix)
+    }
+    if not network_state:
+        raise ValueError(
+            f"pretrained checkpoint contains no network parameters: {path}"
+        )
+    try:
+        model.network.load_state_dict(network_state)
+    except RuntimeError as error:
+        raise ValueError(
+            f"pretrained network is incompatible with the current MLP: {path}"
+        ) from error
+    print(f"Initialized MLP network from: {path}")
 
 
 def save_model(model: HEOMMLP, path: Path) -> None:
@@ -191,7 +227,18 @@ def build_argument_parser():
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="load the --model-path checkpoint before training",
+        help="load the resolved checkpoint before training",
+    )
+    parser.add_argument(
+        "--initialize-from",
+        nargs="?",
+        const="mlp",
+        metavar="FOLDER",
+        help=(
+            "initialize network weights from "
+            "saved_models/FOLDER/mlp_state_dict.pt; if FOLDER is omitted, "
+            "use saved_models/mlp"
+        ),
     )
     parser.add_argument(
         "--plot-loss",
@@ -218,8 +265,12 @@ def build_argument_parser():
     parser.add_argument(
         "--model-path",
         type=Path,
-        default=MLP_MODEL_PATH,
-        help="checkpoint path (default: saved_models/mlp/mlp_state_dict.pt)",
+        help=(
+            "explicit checkpoint path; otherwise a sequence name selects "
+            "saved_models/<name>/mlp_state_dict.pt, and unnamed sequences "
+            "create a timestamped parameter folder for fresh training "
+            "(unnamed --resume still uses saved_models/mlp/mlp_state_dict.pt)"
+        ),
     )
     return parser
 
@@ -271,6 +322,16 @@ _CHECKPOINT_MLP_FIELDS = (
     "dtype",
     "time_switch",
     "switch_time_constant",
+    "normalize_hierarchy_coordinates",
+    "ansatz_scale_normalization",
+    "positive_rdm_ansatz",
+)
+_PRETRAINED_MLP_FIELDS = (
+    "hidden_sizes",
+    "activation",
+    "dtype",
+    "normalize_hierarchy_coordinates",
+    "positive_rdm_ansatz",
 )
 
 
@@ -287,6 +348,13 @@ def _checkpoint_config_differences(
     for name in _CHECKPOINT_MLP_FIELDS:
         if getattr(current.base_mlp, name) != getattr(saved.base_mlp, name):
             differences.append(f"mlp.{name}")
+    if (
+        current.base_mlp.ansatz_scale_normalization
+        and saved.base_mlp.ansatz_scale_normalization
+        and current.base_mlp.normalization_floor
+        != saved.base_mlp.normalization_floor
+    ):
+        differences.append("mlp.normalization_floor")
     return tuple(differences)
 
 
@@ -294,8 +362,18 @@ def _validate_resume_config(
     sequence: TrainingSequence,
     model_path: Path,
 ) -> None:
+    require_complete_training_checkpoint(model_path)
     metadata_path = training_metadata_path(model_path)
     if not metadata_path.is_file():
+        if (
+            sequence.base_mlp.ansatz_scale_normalization
+            or not sequence.base_mlp.normalize_hierarchy_coordinates
+            or sequence.base_mlp.positive_rdm_ansatz
+        ):
+            raise ValueError(
+                "cannot resume with the requested model parameterization "
+                f"because checkpoint metadata is missing: {metadata_path}"
+            )
         return
     saved = load_training_metadata(model_path)
     differences = _checkpoint_config_differences(sequence, saved)
@@ -307,21 +385,158 @@ def _validate_resume_config(
         )
 
 
+def _validate_pretrained_config(
+    sequence: TrainingSequence,
+    pretrained_model_path: Path,
+) -> None:
+    """Validate metadata fields that determine reusable network semantics."""
+    require_complete_training_checkpoint(pretrained_model_path)
+    metadata_path = training_metadata_path(pretrained_model_path)
+    if not metadata_path.is_file():
+        if sequence.base_mlp.positive_rdm_ansatz:
+            raise ValueError(
+                "cannot verify pretrained root-output semantics for a positive "
+                f"RDM ansatz because checkpoint metadata is missing: {metadata_path}"
+            )
+        return
+    saved = load_training_metadata(pretrained_model_path)
+    differences = tuple(
+        f"mlp.{name}"
+        for name in _PRETRAINED_MLP_FIELDS
+        if getattr(sequence.base_mlp, name) != getattr(saved.base_mlp, name)
+    )
+    if differences:
+        rendered = ", ".join(differences)
+        raise ValueError(
+            "pretrained network parameters are incompatible with this "
+            f"training sequence: {rendered}"
+        )
+
+
+def _save_training_stage(
+    model: HEOMMLP,
+    sequence: TrainingSequence,
+    model_path: Path,
+) -> Path:
+    """Replace a checkpoint pair while leaving an interruption marker."""
+    marker_path = training_incomplete_marker_path(model_path)
+    marker_path.write_text(
+        "checkpoint and metadata update in progress\n",
+        encoding="utf-8",
+    )
+    save_model(model, model_path)
+    metadata_path = save_training_metadata(sequence, model_path)
+    marker_path.unlink()
+    return metadata_path
+
+
+class _TeeStream:
+    """Write console output to both the terminal and a persistent log."""
+
+    def __init__(self, *streams) -> None:
+        self.streams = streams
+
+    def write(self, text: str) -> int:
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self) -> bool:
+        return any(
+            getattr(stream, "isatty", lambda: False)()
+            for stream in self.streams
+        )
+
+
 def run_training_sequence(
     sequence: TrainingSequence,
     *,
     resume: bool = False,
     plot_loss: bool = False,
-    model_path: Path = MLP_MODEL_PATH,
+    model_path: Path | None = None,
+    pretrained_model_path: Path | None = None,
 ):
-    """Run all sessions on one in-memory model and checkpoint each stage."""
-    model_path = Path(model_path)
+    """Run all sessions, checkpoint each stage, and tee output to a log."""
+    auto_name = not resume and model_path is None and sequence.name is None
+    model_path = resolve_model_path(sequence, model_path)
+    if (
+        pretrained_model_path is None
+        and sequence.initialize_from is not None
+    ):
+        pretrained_model_path = resolve_pretrained_model_path(
+            sequence.initialize_from
+        )
+    if resume and pretrained_model_path is not None:
+        raise ValueError("resume and pretrained initialization are exclusive")
     if not sequence.sessions:
         raise ValueError("a training sequence must contain at least one session")
-
-    pseudomode = sequence.pseudomode
     if resume:
         _validate_resume_config(sequence, model_path)
+    if pretrained_model_path is not None:
+        pretrained_model_path = Path(pretrained_model_path)
+        if not pretrained_model_path.is_file():
+            raise ValueError(
+                f"pretrained checkpoint does not exist: {pretrained_model_path}"
+            )
+        _validate_pretrained_config(sequence, pretrained_model_path)
+
+    if auto_name:
+        parameters = sequence.pseudomode
+        run_name = (
+            f"{datetime.now():%m-%d-%H-%M}_g_{parameters.g}"
+            f"_L_{parameters.heom_depth}"
+            f"_t_{parameters.t_start}_{parameters.t_stop}"
+        )
+        saved_models = model_path.parent.parent
+        candidate = saved_models / run_name
+        suffix = 2
+        # Reserve the folder atomically so launches in the same minute do
+        # not overwrite each other's checkpoints or training logs.
+        while True:
+            try:
+                candidate.mkdir(parents=True, exist_ok=False)
+                break
+            except FileExistsError:
+                candidate = saved_models / f"{run_name}_{suffix}"
+                suffix += 1
+        sequence = replace(sequence, name=candidate.name)
+        model_path = candidate / model_path.name
+
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path = model_path.parent / "training.log"
+    log_mode = "a" if resume else "w"
+    with log_path.open(
+        log_mode,
+        encoding="utf-8",
+        buffering=1,
+    ) as log_stream:
+        with redirect_stdout(_TeeStream(sys.stdout, log_stream)):
+            if resume:
+                print()
+            print(f"Training log: {log_path}")
+            return _run_training_sequence_body(
+                sequence,
+                resume=resume,
+                plot_loss=plot_loss,
+                model_path=model_path,
+                pretrained_model_path=pretrained_model_path,
+            )
+
+
+def _run_training_sequence_body(
+    sequence: TrainingSequence,
+    *,
+    resume: bool,
+    plot_loss: bool,
+    model_path: Path,
+    pretrained_model_path: Path | None = None,
+):
+    """Implementation executed while stdout is mirrored into training.log."""
+    pseudomode = sequence.pseudomode
     dtype = _training_dtype(sequence)
     try:
         device = torch.device(sequence.base_mlp.device)
@@ -343,18 +558,83 @@ def run_training_sequence(
         activation=sequence.base_mlp.activation,
         time_switch=sequence.base_mlp.time_switch,
         switch_time_constant=sequence.base_mlp.switch_time_constant,
+        normalize_hierarchy_coordinates=(
+            sequence.base_mlp.normalize_hierarchy_coordinates
+        ),
+        positive_rdm_ansatz=sequence.base_mlp.positive_rdm_ansatz,
         dtype=dtype,
         device=device,
     )
     if resume:
         load_saved_model(model, model_path, device)
+    elif pretrained_model_path is not None:
+        load_pretrained_network(model, pretrained_model_path, device)
+
+    anchored_state = (
+        model.complex_initial_state().detach().cpu().numpy()
+    )
+    scales = compute_heom_dynamical_scales(
+        hierarchy,
+        anchored_state,
+        liouvillian,
+        t_start=pseudomode.t_start,
+        t_stop=pseudomode.t_stop,
+        tier_normalized=sequence.base_mlp.tier_normalized_loss,
+        lower_tier_cutoff=sequence.base_mlp.lower_tier_loss_cutoff,
+        lower_tier_weight=sequence.base_mlp.lower_tier_loss_weight,
+        tier_loss_power=sequence.base_mlp.tier_loss_power,
+        time_switch=sequence.base_mlp.time_switch,
+        switch_time_constant=sequence.base_mlp.switch_time_constant,
+        normalization_floor=sequence.base_mlp.normalization_floor,
+    )
+    if sequence.base_mlp.ansatz_scale_normalization:
+        model.set_correction_scale(scales.correction_scale)
 
     objective = HEOMPINNLoss(
         hierarchy,
         liouvillian=liouvillian,
         tier_normalized=sequence.base_mlp.tier_normalized_loss,
+        lower_tier_cutoff=sequence.base_mlp.lower_tier_loss_cutoff,
+        lower_tier_weight=sequence.base_mlp.lower_tier_loss_weight,
+        tier_loss_power=sequence.base_mlp.tier_loss_power,
+        normalization_loss=(
+            scales.effective_constant_loss
+            if sequence.base_mlp.constant_loss_normalization
+            else None
+        ),
         dtype=dtype,
         device=device,
+    )
+    print(
+        "Anchor dynamical scales: "
+        f"L_const={scales.constant_loss:.6e}; "
+        f"effective_L_const={scales.effective_constant_loss:.6e}; "
+        f"global_RMS(L chi_s)="
+        f"{np.sqrt(scales.global_constant_loss):.6e}"
+    )
+    print(
+        "Ansatz correction scale: "
+        + (
+            f"a_s={scales.correction_scale:.6e} (enabled)"
+            if sequence.base_mlp.ansatz_scale_normalization
+            else "a_s=1.000000e+00 (disabled)"
+        )
+    )
+    print(
+        "Constant-loss normalization: "
+        + (
+            "enabled (reported loss = raw loss / effective_L_const)"
+            if sequence.base_mlp.constant_loss_normalization
+            else "disabled"
+        )
+    )
+    print(
+        "Tier-0 RDM ansatz: "
+        + (
+            "normalized A A^dagger; A = sqrt(rho_init) + s(t) * a_s * B"
+            if sequence.base_mlp.positive_rdm_ansatz
+            else "additive symmetric, trace-preserving correction"
+        )
     )
     total_epochs = sum(session.mlp.epochs for session in sequence.sessions)
     loss_plot = (
@@ -372,15 +652,32 @@ def run_training_sequence(
         print(
             "Loss: "
             + (
-                "equal-weight tier-normalized residual"
+                "power-law tier-normalized residual "
+                f"(p={sequence.base_mlp.tier_loss_power:g})"
+                if sequence.base_mlp.tier_loss_power is not None
+                else "two-group tier-normalized residual "
+                f"(tiers 0-{sequence.base_mlp.lower_tier_loss_cutoff}: "
+                f"beta={sequence.base_mlp.lower_tier_loss_weight:g})"
+                if sequence.base_mlp.lower_tier_loss_cutoff is not None
+                else "equal-weight tier-normalized residual"
                 if sequence.base_mlp.tier_normalized_loss
                 else "global ADO-normalized residual"
+            )
+            + (
+                " / effective_L_const"
+                if sequence.base_mlp.constant_loss_normalization
+                else ""
             )
         )
         if parameters.optimizer == "lbfgs":
             print(
                 "Optimizer: L-BFGS (float64, fixed full batch, "
-                "strong-Wolfe line search, fixed loss scaling)"
+                "strong-Wolfe line search, "
+                + (
+                    "dimensionless normalized loss)"
+                    if sequence.base_mlp.constant_loss_normalization
+                    else "legacy fixed loss scaling)"
+                )
             )
         else:
             print("Optimizer: Adam")
@@ -423,10 +720,21 @@ def run_training_sequence(
         results.append(result)
         epoch_offset += parameters.epochs
 
-        save_model(model, model_path)
-        metadata_path = save_training_metadata(sequence, model_path)
+        metadata_path = _save_training_stage(model, sequence, model_path)
         print(f"Session training time: {result.elapsed_seconds:.3f} s")
-        print(f"Session final loss: {result.final.loss:.6e}")
+        if sequence.base_mlp.constant_loss_normalization:
+            raw_final_loss = result.final.raw_loss
+            if raw_final_loss is None:
+                raw_final_loss = (
+                    result.final.loss * scales.effective_constant_loss
+                )
+            print(
+                "Session final normalized loss: "
+                f"{result.final.loss:.6e}"
+            )
+            print(f"Session final raw loss: {raw_final_loss:.6e}")
+        else:
+            print(f"Session final loss: {result.final.loss:.6e}")
         print(f"Saved MLP model: {model_path}")
         print(f"Saved resolved parameters: {metadata_path}")
 
@@ -443,7 +751,6 @@ def main(argv=None):
             "--optimizer cannot be combined with --sequence; set the "
             "optimizer in each TOML session"
         )
-
     try:
         sequence = (
             load_training_sequence(args.sequence)
@@ -471,11 +778,43 @@ def main(argv=None):
         except ValueError as error:
             parser.error(str(error))
 
-    if args.resume:
-        if not args.model_path.is_file():
-            parser.error(f"checkpoint does not exist: {args.model_path}")
+    if args.initialize_from is not None:
         try:
-            _validate_resume_config(sequence, args.model_path)
+            sequence = replace(
+                sequence,
+                initialize_from=args.initialize_from,
+            )
+        except ValueError as error:
+            parser.error(str(error))
+    if args.resume and sequence.initialize_from is not None:
+        parser.error("--resume cannot be combined with transfer initialization")
+
+    model_path = resolve_model_path(sequence, args.model_path)
+    try:
+        pretrained_model_path = (
+            resolve_pretrained_model_path(sequence.initialize_from)
+            if sequence.initialize_from is not None
+            else None
+        )
+    except ValueError as error:
+        parser.error(str(error))
+
+    if args.resume:
+        if not model_path.is_file():
+            parser.error(f"checkpoint does not exist: {model_path}")
+        try:
+            _validate_resume_config(sequence, model_path)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+
+    if pretrained_model_path is not None:
+        if not pretrained_model_path.is_file():
+            parser.error(
+                f"pretrained checkpoint does not exist: "
+                f"{pretrained_model_path}"
+            )
+        try:
+            _validate_pretrained_config(sequence, pretrained_model_path)
         except (OSError, ValueError) as error:
             parser.error(str(error))
 
@@ -483,7 +822,12 @@ def main(argv=None):
         sequence,
         resume=args.resume,
         plot_loss=args.plot_loss,
-        model_path=args.model_path,
+        model_path=(
+            None
+            if not args.resume and args.model_path is None and sequence.name is None
+            else model_path
+        ),
+        pretrained_model_path=pretrained_model_path,
     )
     return model, results[-1]
 

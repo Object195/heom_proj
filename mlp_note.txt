@@ -1,0 +1,33 @@
+\section{The MLP architecture}
+We implement the physics-informed MLP architecture similar to the one in \cite{https://doi.org/10.48550/arxiv.2603.08081} as our baseline model. We propose the following ansatz for the normalized HEOM state for training interval ${t\in[t_0,t_f]}$:
+\begin{align}
+    \tilde{\rho}_\theta(\vec{n},\vec{m},t)&=\tilde{\rho}(\vec{n},\vec{m},t_0)+s(\tau)(\Delta\tilde{\rho}_\theta(\vec{n},\vec{m},\tau)-\delta_{\vec{n},0}\delta_{\vec{m},0}{\rm Tr}[\Delta\tilde{\rho}_\theta(\vec{n},\vec{m},\tau)]I/d)\nonumber\\
+    \Delta\tilde{\rho}_\theta(\vec{n},\vec{m},\tau)&=\frac{1}{2}[\Delta\tilde{\rho}_{\theta,0}(\vec{n}',\vec{m}',\tau)+\Delta\tilde{\rho}_{\theta,0}^\dagger(\vec{m}',\vec{n}',\tau)]
+\end{align}
+ with  $d$ being the dimension of the ADO space (for spin-boson model $d=2$). The normalized ADO indices are implemented as $\vec{n}'=\vec{n}/L,\vec{m}'=\vec{m}/L$, $L$ is the maximum tier level of the truncated HEOM. We define normalized time $\tau=2(t-t_f)/{T}-1,\;\;T=t_f-t_0$ and $s(\tau)=(\tau-\tau_{min})/(\tau_{min}-\tau_{max})$ is chosen to capture the time difference. This ansatz satisfies the physical properties of a valid HEOM state as it enforces the symmetry condition in Eq.~\eqref{eq_conj_sym} and the identity for reduced density matrix ${\rm Tr}(\tilde{\rho}_\theta(0,0,t)=1$. The explicit encoding of initial state automatically ensures that $\tilde{\rho}_\theta(\vec{n},\vec{m},t=0)=\tilde{\rho}(\vec{n},\vec{m},t)$. 
+
+The raw deviation from the initial state $\Delta\tilde{\rho}_{\theta,0}$ is predicted by the MLP given the set of input $\{\vec{n}'=n/L,\vec{m}'=m/L,\tau\}$ where $L$ is the maximum tier level of the truncated HEOM. For a maximum mode truncation number $K$, the MLP model is constructed by defining the $j$th layer in the form $\sigma(XW^{(j)}+b)$, where $\sigma=\tanh$ is the nonlinear activation function, $W_j$ is a trainable matrix of form
+\begin{equation}
+    W^{(1)}\in\mathbb{R}^{(2K+3)\times h_1},\;\;W^{(j)}\in\mathbb{R}^{h_{j-1}\times h_j},\;\;W_f\in\mathbb{R}^{h_D\times 2d^2},
+\end{equation}
+where $h_j$ is the dimension of the $j$th hidden layer. The $2d^2$ real numbers returned by the output layer $W_f$ corresponds to the real and imaginary parts of $\Delta\tilde{\rho}_{\theta,0}$. After $\tilde{\rho}_\theta$ are generated for all indices in the truncated hierarchy, they are stacked in a predetermined fixed order and vectorized into a column vector $\tilde{\chi}_\theta(t)=\bigoplus_{\vec{n},\vec{m}}{\rm vec}[\tilde{\rho}_\theta(\vec{n},\vec{m},t)]\in \mathbb{C}^{4N_A}$, where $N_A=\binom{L+2K+2}{2K+2}$ is the total number of ADOs in the truncated HEOM for level truncation $L$ and mode truncation $K$. The superoperator $\tilde{\mathcal{L}}_{\rm H}$ is generated accordingly such that Eq.~\eqref{eq_heom_normalized} is equivalent to 
+\begin{equation}
+    \partial_t\tilde{\chi}=\tilde{\mathcal{L}}_{\rm H}\tilde{\chi},
+\end{equation} 
+with $\tilde{\chi}$ being the true vectorized full normalized HEOM state. The PINN-residual at time $t$ is defined as:
+\begin{equation}
+    R_\theta(t)=\partial_t\tilde{\chi}_\theta(t)-\tilde{\mathcal{L}}_{\text{H}}\tilde{\chi}_\theta(t).
+\end{equation}
+The corresponding raw loss can be defined as $E_r(\tilde{\chi}_\theta(t))=\lVert  R_\theta(t)\rVert^2$
+\subsection{Normalization of the raw loss}
+Since the number of ADO increases rapidly with tier number and the RDM at tier $0$ is of the most importance, we implement a tier normalized loss function. Define the tier-projection operator:
+\begin{equation}
+    \Pi_l=\bigoplus_{\vec{n},\vec{m}}\delta({\textstyle\sum}_k(\vec{n}_k+\vec{m}_k),l)I_A,
+\end{equation}
+where $I_A$ is the $d\times d$ identity operator of the individual ADO space. For a batch of $q_B$ time points $\{t_q\}$ drawn from the training interval, we define the tier-normalized loss $E$ as:
+\begin{equation}
+    E(\tilde{\chi}_\theta)=\frac{1}{d^2q_B}\sum_{q=1}^{q_B}\sum_{l=0}^{L}\frac{\beta_l}{N_l}\lVert\Pi_l  R_\theta(t_q)\rVert^2, 
+    \label{eq_loss_tier_N}
+\end{equation}
+where $N_l=\binom{l+2K+1}{2K+1}$ is the number of ADO at level $l$ and $\{\beta_l\}$ is a set of additional weight to be tuned manually, satisfying $\sum_l\beta_l=1$.   
+For optimization purposes, we further normalize the loss by normalizing $s(\tau)\to\frac{t_f-t_0}{\sqrt{d^2N_A}}\lVert R_0\rVert s(\tau)$ and $E(\tilde{\chi}_\theta)\to E(\tilde{\chi}_\theta)/E_0$ with $E_0$ evaluated by subsituting $R_\theta(t)$ in Eq.~\eqref{eq_loss_tier_N} with $R_0=\mathcal{\tilde{\mathcal{L}}}_{\rm H}\tilde{\chi}(t_0)$. Here $\tilde{\chi}(t_0)$ is the explicitly coded initial HEOM state. 

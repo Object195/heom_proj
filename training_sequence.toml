@@ -1,4 +1,12 @@
 # Every value omitted here is inherited from experiment_parameters.py.
+# Omit name for an automatic saved_models/MM-DD-HH-MM_g_<g>_L_<L>_t_<start>_<stop>
+# folder. An explicit name writes to saved_models/<name> instead.
+#name = "0827_g_1_0_10_2"
+# Initialize only the reusable network weights from
+# saved_models/<initialize_from>/mlp_state_dict.pt. Comment this out for a
+# fresh random initialization. The command-line --initialize-from option can
+# override this value; its default folder is also "mlp".
+#initialize_from = "0826_0_100_2"
 # Top-level overrides are shared by every session and may include physical or
 # model-construction parameters.
 # To train on a later physical interval, set t_start > 0. The complete HEOM
@@ -12,6 +20,24 @@ device = "cuda"
 dtype = "float64"
 # Give every hierarchy tier equal weight, independent of its ADO count.
 tier_normalized_loss = true
+# Optionally split the tier-normalized loss into two groups. For L=20, these
+# settings assign beta to the mean over tiers 0-5 and 1-beta to tiers 6-20.
+#lower_tier_loss_cutoff = 5
+#lower_tier_loss_weight = 0.75
+# Alternatively, comment out both settings above and enable power-law tier
+# weights proportional to (tier + 1)^(-p). p=0 recovers equal-tier weighting.
+#tier_loss_power = 1.0
+# Divide hierarchy indices by L before passing them to the MLP. Set this to
+# false to use raw integer indices, which do not change when L changes.
+normalize_hierarchy_coordinates = true
+# Optional positive-semidefinite, unit-trace tier-0 RDM. Higher ADOs retain
+# the additive ansatz. False preserves the original model parameterization.
+positive_rdm_ansatz = false
+# Divide the residual loss by its value for the constant anchored trajectory,
+# and scale the dimensionless network correction by the anchored HEOM speed.
+constant_loss_normalization = true
+ansatz_scale_normalization = true
+normalization_floor = 1e-12
 # The default linear switch is (t - t_start) / (t_stop - t_start).
 # To bound the switch during time extrapolation, use the exponential form and
 # set its time constant in the same physical units as t_start and t_stop:
@@ -26,37 +52,37 @@ name = "adam_0"
 
 [sessions.mlp]
 optimizer = "adam"
-epochs = 2000
+epochs = 1000
 learning_rate = 1e-3
 collocation_points = 512
 batch_size = 256
-
+log_every = 100
 [[sessions]]
 name = "adam_1"
 
 [sessions.mlp]
 optimizer = "adam"
-epochs = 2000
+epochs = 1000
 learning_rate = 3e-4
 collocation_points = 512
 batch_size = 256
-
+log_every = 100
 [[sessions]]
 name = "adam_2"
 
 [sessions.mlp]
 optimizer = "adam"
-epochs = 2000
+epochs = 1000
 learning_rate = 1e-4
 collocation_points = 512
 batch_size = 256
-
+log_every = 100
 [[sessions]]
 name = "lbfgs_refinement"
 
 [sessions.mlp]
 optimizer = "lbfgs"
-epochs = 500
+epochs = 100
 collocation_points = 1024
 lbfgs_learning_rate = 1.0
 lbfgs_max_iter = 50

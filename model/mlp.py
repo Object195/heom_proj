@@ -13,15 +13,22 @@ from heom import q_func
 from heom.heom_rep import heom_state
 
 
-def hierarchy_coordinates(hierarchy: heom_state) -> np.ndarray:
-    """Return ``[n/L, m/L]`` rows in the hierarchy's BFS order."""
-    return np.asarray(
+def hierarchy_coordinates(
+    hierarchy: heom_state,
+    *,
+    normalize: bool = True,
+) -> np.ndarray:
+    """Return ``[n/L, m/L]`` or raw ``[n, m]`` rows in BFS order."""
+    if not isinstance(normalize, bool):
+        raise TypeError("normalize must be a boolean")
+    coordinates = np.asarray(
         [
-            np.asarray(n + m, dtype=np.float64) / hierarchy.L
+            np.asarray(n + m, dtype=np.float64)
             for n, m in hierarchy.idx_to_node
         ],
         dtype=np.float64,
     )
+    return coordinates / hierarchy.L if normalize else coordinates
 
 
 def conjugate_ado_permutation(hierarchy: heom_state) -> np.ndarray:
@@ -58,9 +65,13 @@ class HEOMMLP(nn.Module):
     """Shared MLP evaluated at every BFS-ordered ADO coordinate.
 
     ``forward(times)`` returns the constrained physical state
-    ``initial_state + s * correction`` with shape ``(batch, 2*N)``. The real
-    and imaginary halves use ADO-major, column-major ordering, matching the
-    sparse Liouvillian from ``heom_state.build_Liouvillian``.
+    ``initial_state + s * correction_scale * correction`` with shape
+    ``(batch, 2*N)``. The real and imaginary halves use ADO-major,
+    column-major ordering, matching the sparse Liouvillian from
+    ``heom_state.build_Liouvillian``. With ``positive_rdm_ansatz=True``,
+    only the root is replaced by ``A A^dagger / Tr(A A^dagger)``, where
+    ``A = sqrt(rho_initial) + s * correction_scale * B`` and ``B`` is the
+    unconstrained root network output.
     """
 
     def __init__(
@@ -75,6 +86,9 @@ class HEOMMLP(nn.Module):
         activation: str = "tanh",
         time_switch: str = "linear",
         switch_time_constant: float = 1.0,
+        normalize_hierarchy_coordinates: bool = True,
+        positive_rdm_ansatz: bool = False,
+        correction_scale: float = 1.0,
         dtype: torch.dtype = torch.float64,
         device: torch.device | str | None = None,
     ) -> None:
@@ -87,6 +101,16 @@ class HEOMMLP(nn.Module):
         self.system_size = self.system_dimension**2
         self.state_size = self.n_ados * self.system_size
         self.input_size = 2 * (hierarchy.K + 1) + 1
+        if not isinstance(normalize_hierarchy_coordinates, bool):
+            raise TypeError(
+                "normalize_hierarchy_coordinates must be a boolean"
+            )
+        self.normalize_hierarchy_coordinates = (
+            normalize_hierarchy_coordinates
+        )
+        if not isinstance(positive_rdm_ansatz, bool):
+            raise TypeError("positive_rdm_ansatz must be a boolean")
+        self.positive_rdm_ansatz = positive_rdm_ansatz
         self.t_start = float(t_start)
         self.t_stop = float(t_stop)
         self.time_span = self.t_stop - self.t_start
@@ -103,6 +127,9 @@ class HEOMMLP(nn.Module):
             or self.switch_time_constant <= 0.0
         ):
             raise ValueError("switch_time_constant must be finite and positive")
+        correction_scale = float(correction_scale)
+        if not math.isfinite(correction_scale) or correction_scale <= 0.0:
+            raise ValueError("correction_scale must be finite and positive")
         self.normalized_switch_time_constant = (
             self.switch_time_constant / self.time_span
         )
@@ -113,7 +140,10 @@ class HEOMMLP(nn.Module):
         self.register_buffer(
             "ado_coordinates",
             torch.as_tensor(
-                hierarchy_coordinates(hierarchy),
+                hierarchy_coordinates(
+                    hierarchy,
+                    normalize=normalize_hierarchy_coordinates,
+                ),
                 dtype=dtype,
                 device=device,
             ),
@@ -159,6 +189,25 @@ class HEOMMLP(nn.Module):
                 device=device,
             ),
         )
+        self.register_buffer(
+            "correction_scale",
+            torch.as_tensor(correction_scale, dtype=dtype, device=device),
+            persistent=False,
+        )
+        if self.positive_rdm_ansatz:
+            for name in ("root_sqrt_real", "root_sqrt_imag"):
+                self.register_buffer(
+                    name,
+                    torch.zeros(
+                        self.system_dimension, self.system_dimension,
+                        dtype=dtype, device=device,
+                    ),
+                    persistent=False,
+                )
+            self._refresh_root_factor()
+            self.register_load_state_dict_post_hook(
+                self._refresh_root_factor_after_load
+            )
         root_diagonal_indices = np.arange(self.system_dimension) * (
             self.system_dimension + 1
         )
@@ -197,6 +246,56 @@ class HEOMMLP(nn.Module):
             )
         )
         self.network = nn.Sequential(*layers)
+
+    def _refresh_root_factor(self) -> None:
+        """Validate the anchor and cache its principal PSD square root.
+
+        Only floating-point roundoff is repaired. A materially nonphysical
+        root (e.g. from unconverged truncated HEOM) must not be silently
+        projected onto a different initial condition.
+        """
+        initial = self.complex_initial_state().detach().cpu().numpy()
+        root = initial[:self.system_size].reshape(
+            self.system_dimension, self.system_dimension, order="F"
+        )
+        tolerance = 100 * torch.finfo(self.dtype).eps * self.system_dimension
+        if not np.isfinite(root).all():
+            raise ValueError("positive RDM ansatz requires a finite initial RDM")
+        if np.max(np.abs(root - root.conj().T)) > tolerance:
+            raise ValueError("positive RDM ansatz requires a Hermitian initial RDM")
+        if abs(np.trace(root) - 1.0) > tolerance:
+            raise ValueError("positive RDM ansatz requires a unit-trace initial RDM")
+        eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (root + root.conj().T))
+        if eigenvalues.min() < -tolerance:
+            raise ValueError(
+                "positive RDM ansatz requires a positive-semidefinite initial "
+                "RDM; check the initial state or HEOM truncation/solver accuracy"
+            )
+        eigenvalues = np.maximum(eigenvalues, 0.0)
+        eigenvalues /= eigenvalues.sum()
+        root = (eigenvectors * eigenvalues) @ eigenvectors.conj().T
+        root_sqrt = (eigenvectors * np.sqrt(eigenvalues)) @ eigenvectors.conj().T
+        # The same roundoff-cleaned root is used by the anchor, loss scales,
+        # saved state, and square-root factor.
+        flat = root.reshape(-1, order="F")
+        with torch.no_grad():
+            self.initial_state[:self.system_size].copy_(
+                torch.as_tensor(flat.real.copy(), dtype=self.dtype, device=self.device)
+            )
+            self.initial_state[self.state_size:self.state_size + self.system_size].copy_(
+                torch.as_tensor(flat.imag.copy(), dtype=self.dtype, device=self.device)
+            )
+            self.root_sqrt_real.copy_(
+                torch.as_tensor(root_sqrt.real.copy(), dtype=self.dtype, device=self.device)
+            )
+            self.root_sqrt_imag.copy_(
+                torch.as_tensor(root_sqrt.imag.copy(), dtype=self.dtype, device=self.device)
+            )
+
+    def _refresh_root_factor_after_load(self, module, incompatible_keys) -> None:
+        # initial_state is persistent and can change on load_state_dict;
+        # derived buffers must follow it, including direct API checkpoint loads.
+        self._refresh_root_factor()
 
     @property
     def dtype(self) -> torch.dtype:
@@ -268,7 +367,7 @@ class HEOMMLP(nn.Module):
         return flat_u, flat_v
 
     def state_correction(self, times) -> torch.Tensor:
-        """Return a partner-symmetric correction with traceless root ADO."""
+        """Return the legacy additive correction (used by the default ansatz)."""
         real_state, imaginary_state = self.symmetrize_raw(self.raw_output(times))
         real_trace = real_state.index_select(
             1, self.root_diagonal_indices
@@ -287,7 +386,81 @@ class HEOMMLP(nn.Module):
     def forward(self, times) -> torch.Tensor:
         times = self.prepare_times(times)
         switch = self.switching_function(times)
-        return self.initial_state + switch[:, None] * self.state_correction(times)
+        if self.positive_rdm_ansatz:
+            raw = self.raw_output(times)
+            root_u, root_v = self._positive_root(raw[:, 0], switch)
+            symmetric_u, symmetric_v = self.symmetrize_raw(raw)
+            initial_u, initial_v = self.initial_state.split(self.state_size)
+            scale = switch[:, None] * self.correction_scale
+            # Discard the symmetrized root: B is neither symmetrized nor
+            # made traceless. All non-root ADOs keep their previous ansatz.
+            return torch.cat(
+                (
+                    root_u,
+                    initial_u[self.system_size:]
+                    + scale * symmetric_u[:, self.system_size:],
+                    root_v,
+                    initial_v[self.system_size:]
+                    + scale * symmetric_v[:, self.system_size:],
+                ),
+                dim=-1,
+            )
+        return (
+            self.initial_state
+            + switch[:, None]
+            * self.correction_scale
+            * self.state_correction(times)
+        )
+
+    def _positive_root(self, raw_root, switch):
+        """Build the normalized Gram matrix using real arithmetic for JVPs.
+
+        At A=0 the requested quotient has no continuous extension; choose
+        the initial RDM there. For every nonzero A the formula is unchanged.
+        Rescaling before forming the Gram matrix avoids overflow/underflow.
+        """
+        raw_u, raw_v = raw_root.split(self.system_size, dim=-1)
+        scale = switch[:, None, None] * self.correction_scale
+        factor_u = self.root_sqrt_real + scale * column_vector_to_matrix(
+            raw_u, self.system_dimension
+        )
+        factor_v = self.root_sqrt_imag + scale * column_vector_to_matrix(
+            raw_v, self.system_dimension
+        )
+        magnitude = torch.maximum(
+            factor_u.detach().abs().amax(dim=(-2, -1), keepdim=True),
+            factor_v.detach().abs().amax(dim=(-2, -1), keepdim=True),
+        )
+        zero = magnitude == 0
+        factor_u = torch.where(zero, self.root_sqrt_real, factor_u)
+        factor_v = torch.where(zero, self.root_sqrt_imag, factor_v)
+        divisor = torch.where(zero, torch.ones_like(magnitude), magnitude)
+        factor_u = factor_u / divisor
+        factor_v = factor_v / divisor
+        transpose_u = factor_u.transpose(-2, -1)
+        transpose_v = factor_v.transpose(-2, -1)
+        gram_u = factor_u @ transpose_u + factor_v @ transpose_v
+        gram_v = factor_v @ transpose_u - factor_u @ transpose_v
+        trace = (factor_u.square() + factor_v.square()).sum(
+            dim=(-2, -1), keepdim=True
+        )
+        return (
+            matrix_to_column_vector(gram_u / trace),
+            matrix_to_column_vector(gram_v / trace),
+        )
+
+    def set_correction_scale(self, correction_scale: float) -> None:
+        """Update the nonpersistent ansatz scale after loading a checkpoint."""
+        correction_scale = float(correction_scale)
+        if not math.isfinite(correction_scale) or correction_scale <= 0.0:
+            raise ValueError("correction_scale must be finite and positive")
+        with torch.no_grad():
+            self.correction_scale.fill_(correction_scale)
+
+    def complex_initial_state(self) -> torch.Tensor:
+        """Return the constrained full HEOM initial state as a complex vector."""
+        real_state, imaginary_state = self.initial_state.split(self.state_size)
+        return torch.complex(real_state, imaginary_state)
 
     def complex_states(self, times) -> torch.Tensor:
         real_state, imaginary_state = self(times).split(self.state_size, dim=-1)

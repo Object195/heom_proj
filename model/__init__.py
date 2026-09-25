@@ -10,10 +10,12 @@ from .mlp import (
 )
 from .training import (
     EpochRecord,
+    HEOMDynamicalScales,
     HEOMPINNLoss,
     MLPSolution,
     TrainingConfig,
     TrainingResult,
+    compute_heom_dynamical_scales,
     solve_mlp,
     train_mlp,
 )
@@ -21,12 +23,14 @@ from .training import (
 __all__ = [
     "EpochRecord",
     "HEOMMLP",
+    "HEOMDynamicalScales",
     "HEOMPINNLoss",
     "MLPSolution",
     "TrainingConfig",
     "TrainingResult",
     "column_vector_to_matrix",
     "conjugate_ado_permutation",
+    "compute_heom_dynamical_scales",
     "hierarchy_coordinates",
     "matrix_to_column_vector",
     "solve_mlp",

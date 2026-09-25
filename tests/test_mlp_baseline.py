@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import TestCase
 from unittest.mock import patch
 
 import numpy as np
@@ -17,6 +18,7 @@ from model import (
     HEOMPINNLoss,
     TrainingConfig,
     column_vector_to_matrix,
+    compute_heom_dynamical_scales,
     conjugate_ado_permutation,
     hierarchy_coordinates,
     matrix_to_column_vector,
@@ -28,6 +30,7 @@ from model.train_mlp_model import (
     LiveLossPlot,
     build_argument_parser,
     build_optimizer,
+    load_pretrained_network,
     load_saved_model,
 )
 
@@ -76,6 +79,52 @@ def test_coordinates_and_partner_permutation_follow_bfs_order():
             ]
         ),
     )
+    np.testing.assert_allclose(
+        hierarchy_coordinates(hierarchy, normalize=False),
+        np.array(
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [2.0, 0.0],
+                [1.0, 1.0],
+                [0.0, 2.0],
+            ]
+        ),
+    )
+
+
+def test_hierarchy_coordinate_normalization_can_be_disabled():
+    hierarchy = make_hierarchy(depth=2)
+    model = HEOMMLP(
+        hierarchy,
+        hidden_sizes=(4,),
+        rho0=make_rho0(),
+        t_start=0.0,
+        t_stop=1.0,
+        normalize_hierarchy_coordinates=False,
+    )
+
+    torch.testing.assert_close(
+        model.ado_coordinates,
+        torch.as_tensor(
+            hierarchy_coordinates(hierarchy, normalize=False),
+            dtype=model.dtype,
+        ),
+    )
+    assertion = TestCase()
+    with assertion.assertRaisesRegex(
+        TypeError,
+        "normalize_hierarchy_coordinates must be a boolean",
+    ):
+        HEOMMLP(
+            hierarchy,
+            hidden_sizes=(4,),
+            rho0=make_rho0(),
+            t_start=0.0,
+            t_stop=1.0,
+            normalize_hierarchy_coordinates="no",
+        )
 
 
 def test_coordinate_minibatch_has_section_three_shape():
@@ -398,6 +447,54 @@ def test_output_enforces_initial_state_and_root_trace():
     )
 
 
+def test_correction_scale_rescales_the_ansatz_without_entering_state_dict():
+    hierarchy = make_hierarchy(depth=1)
+    common = {
+        "hidden_sizes": (5,),
+        "rho0": make_rho0(),
+        "t_start": 1.0,
+        "t_stop": 3.0,
+    }
+    unscaled = HEOMMLP(hierarchy, correction_scale=1.0, **common)
+    scaled = HEOMMLP(hierarchy, correction_scale=3.0, **common)
+    scaled.load_state_dict(unscaled.state_dict())
+
+    assert "correction_scale" not in unscaled.state_dict()
+    torch.testing.assert_close(
+        unscaled.complex_initial_state(),
+        torch.as_tensor(
+            hierarchy.build_initial_state(make_rho0(), as_sparse=False),
+            dtype=torch.complex128,
+        ),
+    )
+    times = torch.tensor([1.0, 1.75, 3.0], dtype=torch.float64)
+    unscaled_state = unscaled(times)
+    scaled_state = scaled(times)
+    torch.testing.assert_close(unscaled_state[0], unscaled.initial_state)
+    torch.testing.assert_close(scaled_state[0], scaled.initial_state)
+    torch.testing.assert_close(
+        scaled_state - scaled.initial_state,
+        3.0 * (unscaled_state - unscaled.initial_state),
+    )
+
+    initial_time = times[:1]
+    _, unscaled_derivative = state_and_time_derivative(
+        unscaled,
+        initial_time,
+    )
+    _, scaled_derivative = state_and_time_derivative(scaled, initial_time)
+    torch.testing.assert_close(
+        scaled_derivative,
+        3.0 * unscaled_derivative,
+    )
+
+    scaled.set_correction_scale(2.0)
+    torch.testing.assert_close(
+        scaled(times) - scaled.initial_state,
+        2.0 * (unscaled_state - unscaled.initial_state),
+    )
+
+
 def test_jvp_and_loss_backpropagate_to_every_parameter():
     hierarchy = make_hierarchy(depth=1)
     liouvillian = hierarchy.build_Liouvillian(normalized=True)
@@ -481,6 +578,373 @@ def test_tier_normalized_loss_matches_equal_tier_average():
     expected = torch.stack(tier_means).mean()
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_lower_tier_weight_matches_two_group_tier_average():
+    hierarchy = make_hierarchy(depth=2)
+    liouvillian = hierarchy.build_Liouvillian(normalized=True)
+    beta = 0.75
+    objective = HEOMPINNLoss(
+        hierarchy,
+        liouvillian=liouvillian,
+        tier_normalized=True,
+        lower_tier_cutoff=0,
+        lower_tier_weight=beta,
+    )
+    batch_size = 5
+    generator = torch.Generator().manual_seed(456)
+    state = torch.zeros(
+        batch_size,
+        2 * objective.state_size,
+        dtype=torch.float64,
+    )
+    derivative = torch.randn(
+        state.shape,
+        dtype=torch.float64,
+        generator=generator,
+    )
+
+    actual = objective.dynamics_loss(state, derivative)
+    residual_u, residual_v = derivative.split(objective.state_size, dim=-1)
+    energy = (
+        residual_u.reshape(batch_size, hierarchy.nADO, hierarchy.system_size)
+        .square()
+        + residual_v.reshape(
+            batch_size,
+            hierarchy.nADO,
+            hierarchy.system_size,
+        ).square()
+    )
+    tier_means = []
+    for tier in range(hierarchy.L + 1):
+        indices = torch.as_tensor(
+            [
+                index
+                for index, node in enumerate(hierarchy.idx_to_node)
+                if hierarchy._tier(node) == tier
+            ],
+            dtype=torch.long,
+        )
+        tier_means.append(energy.index_select(1, indices).mean())
+    expected = beta * tier_means[0] + (1.0 - beta) * torch.stack(
+        tier_means[1:]
+    ).mean()
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_tier_loss_power_matches_normalized_power_law_average():
+    hierarchy = make_hierarchy(depth=2)
+    liouvillian = hierarchy.build_Liouvillian(normalized=True)
+    power = 2.0
+    objective = HEOMPINNLoss(
+        hierarchy,
+        liouvillian=liouvillian,
+        tier_normalized=True,
+        tier_loss_power=power,
+    )
+    batch_size = 5
+    generator = torch.Generator().manual_seed(789)
+    state = torch.zeros(
+        batch_size,
+        2 * objective.state_size,
+        dtype=torch.float64,
+    )
+    derivative = torch.randn(
+        state.shape,
+        dtype=torch.float64,
+        generator=generator,
+    )
+
+    actual = objective.dynamics_loss(state, derivative)
+    residual_u, residual_v = derivative.split(objective.state_size, dim=-1)
+    energy = (
+        residual_u.reshape(batch_size, hierarchy.nADO, hierarchy.system_size)
+        .square()
+        + residual_v.reshape(
+            batch_size,
+            hierarchy.nADO,
+            hierarchy.system_size,
+        ).square()
+    )
+    tier_means = []
+    for tier in range(hierarchy.L + 1):
+        indices = torch.as_tensor(
+            [
+                index
+                for index, node in enumerate(hierarchy.idx_to_node)
+                if hierarchy._tier(node) == tier
+            ],
+            dtype=torch.long,
+        )
+        tier_means.append(energy.index_select(1, indices).mean())
+    weights = torch.arange(
+        1,
+        hierarchy.L + 2,
+        dtype=torch.float64,
+    ).pow(-power)
+    expected = torch.sum(weights * torch.stack(tier_means)) / weights.sum()
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_lower_tier_weight_validates_the_two_group_configuration():
+    hierarchy = make_hierarchy(depth=2)
+    assertion = TestCase()
+
+    with assertion.assertRaisesRegex(ValueError, "must be set together"):
+        HEOMPINNLoss(
+            hierarchy,
+            tier_normalized=True,
+            lower_tier_cutoff=0,
+        )
+    with assertion.assertRaisesRegex(ValueError, "requires tier_normalized"):
+        HEOMPINNLoss(
+            hierarchy,
+            tier_normalized=False,
+            lower_tier_cutoff=0,
+            lower_tier_weight=0.5,
+        )
+    with assertion.assertRaisesRegex(ValueError, "maximum occupied tier"):
+        HEOMPINNLoss(
+            hierarchy,
+            tier_normalized=True,
+            lower_tier_cutoff=2,
+            lower_tier_weight=0.5,
+        )
+    with assertion.assertRaisesRegex(ValueError, "between 0 and 1"):
+        HEOMPINNLoss(
+            hierarchy,
+            tier_normalized=True,
+            lower_tier_cutoff=0,
+            lower_tier_weight=1.1,
+        )
+    with assertion.assertRaisesRegex(ValueError, "mutually exclusive"):
+        HEOMPINNLoss(
+            hierarchy,
+            tier_normalized=True,
+            lower_tier_cutoff=0,
+            lower_tier_weight=0.5,
+            tier_loss_power=1.0,
+        )
+    with assertion.assertRaisesRegex(ValueError, "requires tier_normalized"):
+        HEOMPINNLoss(
+            hierarchy,
+            tier_normalized=False,
+            tier_loss_power=1.0,
+        )
+
+
+def test_dynamical_scales_match_global_and_equal_tier_constant_losses():
+    hierarchy = make_hierarchy(depth=2)
+    liouvillian = hierarchy.build_Liouvillian(normalized=True)
+    initial_state = hierarchy.build_initial_state(
+        make_rho0(),
+        as_sparse=False,
+    )
+    rhs = np.asarray(liouvillian @ initial_state).reshape(
+        hierarchy.nADO,
+        hierarchy.system_size,
+    )
+    component_energy = np.abs(rhs) ** 2
+    expected_global = float(component_energy.mean())
+    expected_tiers = []
+    for tier in range(hierarchy.L + 1):
+        indices = [
+            index
+            for index, node in enumerate(hierarchy.idx_to_node)
+            if hierarchy._tier(node) == tier
+        ]
+        expected_tiers.append(float(component_energy[indices].mean()))
+    expected_tier_average = float(np.mean(expected_tiers))
+
+    common = {
+        "t_start": 2.0,
+        "t_stop": 6.0,
+        "normalization_floor": 1e-30,
+    }
+    global_scales = compute_heom_dynamical_scales(
+        hierarchy,
+        initial_state,
+        liouvillian,
+        tier_normalized=False,
+        **common,
+    )
+    tier_scales = compute_heom_dynamical_scales(
+        hierarchy,
+        initial_state,
+        liouvillian,
+        tier_normalized=True,
+        **common,
+    )
+    beta = 0.75
+    grouped_scales = compute_heom_dynamical_scales(
+        hierarchy,
+        initial_state,
+        liouvillian,
+        tier_normalized=True,
+        lower_tier_cutoff=0,
+        lower_tier_weight=beta,
+        **common,
+    )
+    power = 2.0
+    power_scales = compute_heom_dynamical_scales(
+        hierarchy,
+        initial_state,
+        liouvillian,
+        tier_normalized=True,
+        tier_loss_power=power,
+        **common,
+    )
+
+    assert np.isclose(global_scales.constant_loss, expected_global)
+    assert np.isclose(tier_scales.constant_loss, expected_tier_average)
+    assert np.isclose(
+        grouped_scales.constant_loss,
+        beta * expected_tiers[0]
+        + (1.0 - beta) * np.mean(expected_tiers[1:]),
+    )
+    power_weights = np.arange(1, hierarchy.L + 2, dtype=np.float64) ** (-power)
+    assert np.isclose(
+        power_scales.constant_loss,
+        np.dot(power_weights, expected_tiers) / power_weights.sum(),
+    )
+    assert np.isclose(tier_scales.global_constant_loss, expected_global)
+    assert np.isclose(global_scales.initial_switch_slope, 0.25)
+    expected_linear_scale = 4.0 * np.sqrt(expected_global)
+    assert np.isclose(global_scales.correction_scale, expected_linear_scale)
+    # The ansatz scale is a property of the dynamics, not of loss weighting.
+    assert np.isclose(tier_scales.correction_scale, expected_linear_scale)
+
+    time_constant = 0.75
+    exponential_scales = compute_heom_dynamical_scales(
+        hierarchy,
+        initial_state,
+        liouvillian,
+        tier_normalized=True,
+        time_switch="exponential",
+        switch_time_constant=time_constant,
+        **common,
+    )
+    denominator = -np.expm1(-4.0 / time_constant)
+    expected_slope = 1.0 / (time_constant * denominator)
+    assert np.isclose(
+        exponential_scales.initial_switch_slope,
+        expected_slope,
+    )
+    assert np.isclose(
+        exponential_scales.correction_scale,
+        np.sqrt(expected_global) / expected_slope,
+    )
+
+
+def test_l_const_normalization_uses_the_same_configured_tier_loss():
+    hierarchy = make_hierarchy(depth=2)
+    liouvillian = hierarchy.build_Liouvillian(normalized=True)
+    initial_state = hierarchy.build_initial_state(
+        make_rho0(),
+        as_sparse=False,
+    )
+    real_initial_state = torch.as_tensor(
+        q_func.state_to_real(initial_state)[None],
+        dtype=torch.float64,
+    ).repeat(3, 1)
+    zero_derivative = torch.zeros_like(real_initial_state)
+
+    loss_configurations = (
+        (False, None, None, None),
+        (True, None, None, None),
+        (True, 0, 0.75, None),
+        (True, None, None, 2.0),
+    )
+    for (
+        tier_normalized,
+        lower_tier_cutoff,
+        lower_tier_weight,
+        tier_loss_power,
+    ) in loss_configurations:
+        scales = compute_heom_dynamical_scales(
+            hierarchy,
+            initial_state,
+            liouvillian,
+            t_start=0.0,
+            t_stop=1.0,
+            tier_normalized=tier_normalized,
+            lower_tier_cutoff=lower_tier_cutoff,
+            lower_tier_weight=lower_tier_weight,
+            tier_loss_power=tier_loss_power,
+            normalization_floor=1e-30,
+        )
+        objective = HEOMPINNLoss(
+            hierarchy,
+            liouvillian=liouvillian,
+            tier_normalized=tier_normalized,
+            lower_tier_cutoff=lower_tier_cutoff,
+            lower_tier_weight=lower_tier_weight,
+            tier_loss_power=tier_loss_power,
+            normalization_loss=scales.effective_constant_loss,
+        )
+
+        raw_loss = objective.raw_dynamics_loss(
+            real_initial_state,
+            zero_derivative,
+        )
+        normalized_loss = objective.dynamics_loss(
+            real_initial_state,
+            zero_derivative,
+        )
+        torch.testing.assert_close(
+            raw_loss,
+            raw_loss.new_tensor(scales.constant_loss),
+        )
+        torch.testing.assert_close(
+            normalized_loss,
+            normalized_loss.new_tensor(1.0),
+        )
+
+
+def test_zero_dynamics_uses_the_normalization_floor_without_nan():
+    hierarchy = make_hierarchy(depth=2)
+    liouvillian = hierarchy.build_Liouvillian(normalized=True)
+    zero_liouvillian = 0.0 * liouvillian
+    initial_state = hierarchy.build_initial_state(
+        make_rho0(),
+        as_sparse=False,
+    )
+    floor = 4e-10
+    time_span = 3.0
+    scales = compute_heom_dynamical_scales(
+        hierarchy,
+        initial_state,
+        zero_liouvillian,
+        t_start=1.0,
+        t_stop=1.0 + time_span,
+        tier_normalized=True,
+        normalization_floor=floor,
+    )
+
+    assert scales.constant_loss == 0.0
+    assert scales.global_constant_loss == 0.0
+    assert scales.effective_constant_loss == floor
+    assert scales.effective_global_constant_loss == floor
+    assert np.isclose(
+        scales.correction_scale,
+        time_span * np.sqrt(floor),
+    )
+
+    objective = HEOMPINNLoss(
+        hierarchy,
+        liouvillian=zero_liouvillian,
+        tier_normalized=True,
+        normalization_loss=scales.effective_constant_loss,
+    )
+    state = torch.as_tensor(
+        q_func.state_to_real(initial_state)[None],
+        dtype=torch.float64,
+    )
+    normalized_loss = objective.dynamics_loss(state, torch.zeros_like(state))
+    assert torch.isfinite(normalized_loss)
+    assert normalized_loss.item() == 0.0
 
 
 def test_partial_minibatches_match_the_full_objective():
@@ -673,6 +1137,57 @@ def test_lbfgs_optimizes_residual_sum_but_reports_mean_loss():
     assert np.isclose(observed_optimizer_loss, expected_scale * mean_loss)
 
 
+def test_l_const_normalized_lbfgs_uses_dimensionless_loss_directly():
+    hierarchy = make_hierarchy(depth=1)
+    liouvillian = hierarchy.build_Liouvillian(normalized=True)
+    model = HEOMMLP(
+        hierarchy,
+        hidden_sizes=(5,),
+        rho0=make_rho0(),
+        t_start=0.0,
+        t_stop=0.2,
+        dtype=torch.float64,
+    )
+    normalization_loss = 0.125
+    objective = HEOMPINNLoss(
+        hierarchy,
+        liouvillian=liouvillian,
+        normalization_loss=normalization_loss,
+        dtype=torch.float64,
+    )
+    optimizer = build_optimizer(model, "lbfgs")
+    config = TrainingConfig(
+        t_start=0.0,
+        t_stop=0.2,
+        epochs=1,
+        collocation_points=5,
+        batch_size=5,
+    )
+    observed_optimizer_loss = None
+
+    def one_closure_step(closure):
+        nonlocal observed_optimizer_loss
+        observed_optimizer_loss = closure().detach().item()
+
+    with patch.object(optimizer, "step", side_effect=one_closure_step):
+        result = train_mlp(
+            model,
+            objective,
+            config,
+            optimizer=optimizer,
+            verbose=False,
+        )
+
+    times = torch.linspace(0.0, 0.2, 5, dtype=torch.float64)
+    normalized_loss = objective(model, times).detach().item()
+    assert np.isclose(observed_optimizer_loss, normalized_loss)
+    assert np.isclose(result.final.loss, normalized_loss)
+    assert np.isclose(
+        result.final.raw_loss,
+        normalization_loss * normalized_loss,
+    )
+
+
 def test_saved_model_can_be_loaded_for_additional_training():
     hierarchy = make_hierarchy(depth=1)
     model = HEOMMLP(
@@ -696,6 +1211,43 @@ def test_saved_model_can_be_loaded_for_additional_training():
 
     for name, value in model.state_dict().items():
         torch.testing.assert_close(value, expected[name])
+
+
+def test_pretrained_network_loads_across_depths_without_initial_state():
+    source = HEOMMLP(
+        make_hierarchy(depth=1),
+        hidden_sizes=(5,),
+        rho0=make_rho0(),
+        t_start=0.0,
+        t_stop=1.0,
+        normalize_hierarchy_coordinates=False,
+    )
+    destination = HEOMMLP(
+        make_hierarchy(depth=2),
+        hidden_sizes=(5,),
+        rho0=make_rho0(),
+        t_start=0.0,
+        t_stop=1.0,
+        normalize_hierarchy_coordinates=False,
+    )
+    expected_network = {
+        name: value.detach().clone()
+        for name, value in source.network.state_dict().items()
+    }
+    destination_initial_state = destination.initial_state.detach().clone()
+
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "mlp_state_dict.pt"
+        torch.save(source.state_dict(), path)
+        load_pretrained_network(destination, path, torch.device("cpu"))
+
+    for name, value in destination.network.state_dict().items():
+        torch.testing.assert_close(value, expected_network[name])
+    torch.testing.assert_close(
+        destination.initial_state,
+        destination_initial_state,
+    )
+    assert source.initial_state.shape != destination.initial_state.shape
 
 
 def test_live_loss_plot_uses_log_scale():

@@ -17,6 +17,246 @@ from heom.heom_rep import heom_state
 from .mlp import HEOMMLP, state_and_time_derivative
 
 
+def _ado_residual_weights(
+    hierarchy: heom_state,
+    tier_normalized: bool,
+    *,
+    lower_tier_cutoff: int | None = None,
+    lower_tier_weight: float | None = None,
+    tier_loss_power: float | None = None,
+) -> np.ndarray:
+    """Return per-ADO weights for the configured residual average."""
+    if not isinstance(tier_normalized, bool):
+        raise TypeError("tier_normalized must be a boolean")
+    if (lower_tier_cutoff is None) != (lower_tier_weight is None):
+        raise ValueError(
+            "lower_tier_cutoff and lower_tier_weight must be set together"
+        )
+    if lower_tier_cutoff is not None and tier_loss_power is not None:
+        raise ValueError(
+            "lower-tier two-group weighting and tier_loss_power are "
+            "mutually exclusive"
+        )
+    if (
+        lower_tier_cutoff is not None or tier_loss_power is not None
+    ) and not tier_normalized:
+        raise ValueError(
+            "custom tier weighting requires tier_normalized=True"
+        )
+    if not tier_normalized:
+        return np.ones(hierarchy.nADO, dtype=np.float64)
+
+    ado_tiers = np.asarray(
+        [hierarchy._tier(node) for node in hierarchy.idx_to_node],
+        dtype=np.int64,
+    )
+    max_tier = int(ado_tiers.max(initial=0))
+    tier_counts = np.bincount(ado_tiers, minlength=max_tier + 1)
+    if tier_loss_power is not None:
+        if isinstance(tier_loss_power, bool):
+            raise TypeError("tier_loss_power must be a finite number")
+        tier_loss_power = float(tier_loss_power)
+        if not np.isfinite(tier_loss_power):
+            raise ValueError("tier_loss_power must be finite")
+        with np.errstate(over="ignore", invalid="ignore"):
+            logits = -tier_loss_power * np.log1p(
+                np.arange(max_tier + 1, dtype=np.float64)
+            )
+        if not np.isfinite(logits).all():
+            raise ValueError(
+                "tier_loss_power is too large to produce finite weights"
+            )
+        logits -= logits.max()
+        tier_weights = np.exp(logits)
+        tier_weights /= tier_weights.sum()
+        return (
+            hierarchy.nADO
+            * tier_weights[ado_tiers]
+            / tier_counts[ado_tiers]
+        )
+    if lower_tier_cutoff is not None:
+        if (
+            isinstance(lower_tier_cutoff, bool)
+            or not isinstance(lower_tier_cutoff, int)
+        ):
+            raise TypeError("lower_tier_cutoff must be an integer")
+        if lower_tier_cutoff < 0 or lower_tier_cutoff >= max_tier:
+            raise ValueError(
+                "lower_tier_cutoff must be between 0 and one less than the "
+                f"maximum occupied tier ({max_tier})"
+            )
+        if isinstance(lower_tier_weight, bool):
+            raise TypeError("lower_tier_weight must be a finite number")
+        lower_tier_weight = float(lower_tier_weight)
+        if (
+            not np.isfinite(lower_tier_weight)
+            or not 0.0 <= lower_tier_weight <= 1.0
+        ):
+            raise ValueError("lower_tier_weight must be between 0 and 1")
+
+        n_lower_tiers = lower_tier_cutoff + 1
+        n_upper_tiers = max_tier - lower_tier_cutoff
+        tier_weights = np.empty(max_tier + 1, dtype=np.float64)
+        tier_weights[:n_lower_tiers] = (
+            lower_tier_weight / n_lower_tiers
+        )
+        tier_weights[n_lower_tiers:] = (
+            (1.0 - lower_tier_weight) / n_upper_tiers
+        )
+        # The loss divides by nADO, so distribute each tier's total mixture
+        # weight uniformly over the ADOs in that tier.
+        return (
+            hierarchy.nADO
+            * tier_weights[ado_tiers]
+            / tier_counts[ado_tiers]
+        )
+
+    # The loss divides by nADO. Multiplying every ADO in tier l by
+    # nADO / ((L + 1) * N_l) produces an equal average over occupied tiers.
+    return hierarchy.nADO / (
+        (max_tier + 1) * tier_counts[ado_tiers]
+    )
+
+
+@dataclass(frozen=True)
+class HEOMDynamicalScales:
+    """Local residual and ansatz scales derived from the anchored HEOM state."""
+
+    constant_loss: float
+    effective_constant_loss: float
+    global_constant_loss: float
+    effective_global_constant_loss: float
+    initial_switch_slope: float
+    correction_scale: float
+
+
+def compute_heom_dynamical_scales(
+    hierarchy: heom_state,
+    initial_state,
+    liouvillian,
+    *,
+    t_start: float,
+    t_stop: float,
+    tier_normalized: bool = False,
+    lower_tier_cutoff: int | None = None,
+    lower_tier_weight: float | None = None,
+    tier_loss_power: float | None = None,
+    time_switch: str = "linear",
+    switch_time_constant: float = 1.0,
+    normalization_floor: float = 1e-12,
+) -> HEOMDynamicalScales:
+    r"""Compute ``L_const`` and ``a_s`` from the full anchored HEOM state.
+
+    ``constant_loss`` uses the same global, equal-tier, two-group, or
+    power-law mean-square norm as :class:`HEOMPINNLoss`.  The scalar ansatz
+    scale uses the global component RMS of ``L @ initial_state`` so model
+    semantics do not depend on loss-tier weighting.  It is divided by the
+    switch slope at ``t_start``; for a linear switch this gives
+    ``a_s = T * RMS(L @ initial_state)``.
+    """
+    if not isinstance(tier_normalized, bool):
+        raise TypeError("tier_normalized must be a boolean")
+    normalization_floor = float(normalization_floor)
+    if not np.isfinite(normalization_floor) or normalization_floor <= 0.0:
+        raise ValueError("normalization_floor must be finite and positive")
+
+    t_start = float(t_start)
+    t_stop = float(t_stop)
+    time_span = t_stop - t_start
+    if not np.isfinite(time_span) or time_span <= 0.0:
+        raise ValueError("t_stop must be finite and greater than t_start")
+
+    if isinstance(initial_state, torch.Tensor):
+        initial_state = initial_state.detach().cpu().numpy()
+    initial_state = np.asarray(initial_state, dtype=np.complex128)
+    expected_size = hierarchy.nADO * hierarchy.system_size
+    if initial_state.shape != (expected_size,):
+        raise ValueError(
+            "initial_state must be a flat full HEOM vector with shape "
+            f"({expected_size},)"
+        )
+    if not np.isfinite(initial_state).all():
+        raise ValueError("initial_state must contain only finite values")
+
+    rhs = np.asarray(liouvillian @ initial_state, dtype=np.complex128)
+    if rhs.shape != (expected_size,):
+        raise ValueError(
+            "liouvillian must map the full HEOM state to a flat vector with "
+            f"shape ({expected_size},)"
+        )
+    if not np.isfinite(rhs).all():
+        raise ValueError("liouvillian action must contain only finite values")
+    component_energy = np.abs(
+        rhs.reshape(hierarchy.nADO, hierarchy.system_size)
+    ) ** 2
+    global_constant_loss = float(component_energy.mean())
+    ado_weights = _ado_residual_weights(
+        hierarchy,
+        tier_normalized,
+        lower_tier_cutoff=lower_tier_cutoff,
+        lower_tier_weight=lower_tier_weight,
+        tier_loss_power=tier_loss_power,
+    )
+    constant_loss = float(
+        np.sum(component_energy * ado_weights[:, None])
+        / (hierarchy.nADO * hierarchy.system_size)
+    )
+    if not np.isfinite(constant_loss) or not np.isfinite(
+        global_constant_loss
+    ):
+        raise ValueError("constant-state loss must be finite")
+
+    effective_constant_loss = max(constant_loss, normalization_floor)
+    effective_global_constant_loss = max(
+        global_constant_loss,
+        normalization_floor,
+    )
+
+    if not isinstance(time_switch, str):
+        raise ValueError("time_switch must be 'linear' or 'exponential'")
+    time_switch = time_switch.lower()
+    if time_switch == "linear":
+        initial_switch_slope = 1.0 / time_span
+    elif time_switch == "exponential":
+        switch_time_constant = float(switch_time_constant)
+        if (
+            not np.isfinite(switch_time_constant)
+            or switch_time_constant <= 0.0
+        ):
+            raise ValueError(
+                "switch_time_constant must be finite and positive"
+            )
+        denominator = -np.expm1(-time_span / switch_time_constant)
+        if not np.isfinite(denominator) or denominator <= 0.0:
+            raise ValueError(
+                "exponential switch normalization must be finite and positive"
+            )
+        initial_switch_slope = 1.0 / (
+            switch_time_constant * denominator
+        )
+    else:
+        raise ValueError("time_switch must be 'linear' or 'exponential'")
+
+    if (
+        not np.isfinite(initial_switch_slope)
+        or initial_switch_slope <= 0.0
+    ):
+        raise ValueError("initial switch slope must be finite and positive")
+    correction_scale = (
+        np.sqrt(effective_global_constant_loss) / initial_switch_slope
+    )
+    if not np.isfinite(correction_scale) or correction_scale <= 0.0:
+        raise ValueError("correction scale must be finite and positive")
+    return HEOMDynamicalScales(
+        constant_loss=constant_loss,
+        effective_constant_loss=effective_constant_loss,
+        global_constant_loss=global_constant_loss,
+        effective_global_constant_loss=effective_global_constant_loss,
+        initial_switch_slope=float(initial_switch_slope),
+        correction_scale=float(correction_scale),
+    )
+
+
 def scipy_sparse_to_torch(
     matrix,
     *,
@@ -51,6 +291,10 @@ class HEOMPINNLoss(nn.Module):
         *,
         liouvillian=None,
         tier_normalized: bool = False,
+        lower_tier_cutoff: int | None = None,
+        lower_tier_weight: float | None = None,
+        tier_loss_power: float | None = None,
+        normalization_loss: float | None = None,
         dtype: torch.dtype = torch.float64,
         device: torch.device | str | None = None,
     ) -> None:
@@ -65,26 +309,29 @@ class HEOMPINNLoss(nn.Module):
 
         self.state_size = hierarchy.nADO * hierarchy.system_size
         self.tier_normalized = tier_normalized
+        self.loss_is_normalized = normalization_loss is not None
+        if normalization_loss is None:
+            normalization_loss = 1.0
+        normalization_loss = float(normalization_loss)
+        if not np.isfinite(normalization_loss) or normalization_loss <= 0.0:
+            raise ValueError("normalization_loss must be finite and positive")
+        self.register_buffer(
+            "normalization_loss",
+            torch.as_tensor(normalization_loss, dtype=dtype, device=device),
+            persistent=False,
+        )
 
-        residual_weights = np.ones(2 * self.state_size, dtype=np.float64)
-        if tier_normalized:
-            ado_tiers = np.asarray(
-                [hierarchy._tier(node) for node in hierarchy.idx_to_node],
-                dtype=np.int64,
-            )
-            max_tier = int(ado_tiers.max(initial=0))
-            tier_counts = np.bincount(ado_tiers, minlength=max_tier + 1)
-            # The original loss divides by nADO.  Multiplying every ADO in
-            # tier l by nADO / ((L + 1) * N_l) cancels that global nADO and
-            # produces an equal average over tiers:
-            #   1/(L+1) sum_l 1/(B*d^2*N_l) sum_(q,j in l) |R_qj|^2.
-            ado_weights = hierarchy.nADO / (
-                (max_tier + 1) * tier_counts[ado_tiers]
-            )
-            complex_weights = np.repeat(ado_weights, hierarchy.system_size)
-            residual_weights = np.concatenate(
-                (complex_weights, complex_weights)
-            )
+        ado_weights = _ado_residual_weights(
+            hierarchy,
+            tier_normalized,
+            lower_tier_cutoff=lower_tier_cutoff,
+            lower_tier_weight=lower_tier_weight,
+            tier_loss_power=tier_loss_power,
+        )
+        complex_weights = np.repeat(ado_weights, hierarchy.system_size)
+        residual_weights = np.concatenate(
+            (complex_weights, complex_weights)
+        )
         self.register_buffer(
             "residual_weights",
             torch.as_tensor(residual_weights, dtype=dtype, device=device),
@@ -107,7 +354,7 @@ class HEOMPINNLoss(nn.Module):
             state.transpose(0, 1),
         ).transpose(0, 1)
 
-    def dynamics_loss(
+    def raw_dynamics_loss(
         self,
         state: torch.Tensor,
         time_derivative: torch.Tensor,
@@ -120,6 +367,15 @@ class HEOMPINNLoss(nn.Module):
             # second full residual tensor inside every optimizer closure.
             squared_residual.mul_(self.residual_weights)
         return squared_residual.sum() / (self.state_size * state.shape[0])
+
+    def dynamics_loss(
+        self,
+        state: torch.Tensor,
+        time_derivative: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.raw_dynamics_loss(state, time_derivative) / (
+            self.normalization_loss
+        )
 
     def forward(
         self,
@@ -155,6 +411,7 @@ class EpochRecord:
     lbfgs_iterations: int | None = None
     lbfgs_evaluations: int | None = None
     lbfgs_curvature_pairs: int | None = None
+    raw_loss: float | None = None
 
 
 @dataclass(frozen=True)
@@ -232,8 +489,13 @@ def train_mlp(
         # curvature pairs; the tiny reported scale can therefore leave its
         # history permanently empty.  Apply one fixed equivalent scaling for
         # optimization while retaining the normalized loss for reporting.
-        # The same scale is suitable for both global and tier-normalized loss.
-        lbfgs_loss_scale = objective.state_size * fixed_times.numel()
+        # A loss divided by L_const is already order one and needs no extra
+        # residual-sum scaling.
+        lbfgs_loss_scale = (
+            1.0
+            if objective.loss_is_normalized
+            else objective.state_size * fixed_times.numel()
+        )
     elif not config.resample_each_epoch:
         fixed_times = _collocation_times(
             config,
@@ -348,14 +610,20 @@ def train_mlp(
                 optimizer.step()
                 total += batch_times.numel() * loss.detach().item()
 
+        reported_loss = total / config.collocation_points
         record = EpochRecord(
-            epoch,
-            total / config.collocation_points,
-            gradient_inf,
-            parameter_change_inf,
-            lbfgs_iterations,
-            lbfgs_evaluations,
-            lbfgs_curvature_pairs,
+            epoch=epoch,
+            loss=reported_loss,
+            gradient_inf=gradient_inf,
+            parameter_change_inf=parameter_change_inf,
+            lbfgs_iterations=lbfgs_iterations,
+            lbfgs_evaluations=lbfgs_evaluations,
+            lbfgs_curvature_pairs=lbfgs_curvature_pairs,
+            raw_loss=(
+                reported_loss * objective.normalization_loss.item()
+                if objective.loss_is_normalized
+                else reported_loss
+            ),
         )
         history.append(record)
         if callback is not None:
@@ -365,6 +633,8 @@ def train_mlp(
                 f"Epoch {epoch:6d}/{config.epochs}: "
                 f"loss={record.loss:.6e}"
             )
+            if objective.loss_is_normalized:
+                message += f"  raw_loss={record.raw_loss:.6e}"
             if using_lbfgs:
                 message += (
                     f"  g_inf={record.gradient_inf:.6e}"
@@ -428,10 +698,12 @@ def solve_mlp(
 
 __all__ = [
     "EpochRecord",
+    "HEOMDynamicalScales",
     "HEOMPINNLoss",
     "MLPSolution",
     "TrainingConfig",
     "TrainingResult",
+    "compute_heom_dynamical_scales",
     "solve_mlp",
     "train_mlp",
 ]
